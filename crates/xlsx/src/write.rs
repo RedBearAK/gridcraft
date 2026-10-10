@@ -126,6 +126,8 @@ pub struct Out {
     pub cell_pictures: crate::richdata::PicturesOut,
     /// Kept (pass-through) parts written so far.
     pub kept: crate::passthrough::KeptOut,
+    /// Shared formulas converted to file form once (see `fmla::to_file_shared`).
+    pub file_exprs: crate::fmla::FileExprs,
 }
 
 impl Out {
@@ -211,6 +213,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         needs_calc: false,
         cell_pictures: Default::default(),
         kept: Default::default(),
+        file_exprs: Default::default(),
     };
     out.default_type("rels", "application/vnd.openxmlformats-package.relationships+xml");
     out.default_type("xml", "application/xml");

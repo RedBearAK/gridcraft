@@ -345,11 +345,8 @@ fn range_fill(s: &mut Session, p: &Json) -> Result<Json> {
             }
             for at in r.iter() {
                 let mut cell = base.clone().unwrap_or_default();
-                if let Some(f) = &cell.formula
-                    && let Some(e) = f.expr()
-                {
-                    let shifted = gridcraft_formula::adjust::shift_relative(e, at.row as i64 - origin.row as i64, at.col as i64 - origin.col as i64);
-                    cell.formula = Some(std::sync::Arc::new(Formula::from_expr(shifted)));
+                if let Some(f) = &cell.formula {
+                    cell.formula = Some(std::sync::Arc::new(f.moved(at.row as i64 - origin.row as i64, at.col as i64 - origin.col as i64)));
                 }
                 cell.style = cx.wb.sheet(sheet).and_then(|sh| sh.cell(at)).map(|c| c.style).unwrap_or(cell.style);
                 cx.sheet_mut(sheet)?.set_cell(at, cell);
@@ -980,8 +977,8 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                         let mut new = old.clone();
                         let shift = |cell: &Cell| -> Option<std::sync::Arc<Formula>> {
                             let f = cell.formula.as_ref()?;
-                            let e = f.expr()?;
                             if cut_move {
+                                let e = f.expr()?;
                                 // A moved formula still reads cells on its original sheet. Qualify
                                 // those references before the workbook-wide move adjustment below.
                                 let e = if dest_sheet != clip.sheet {
@@ -1001,9 +998,8 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                                 moved.array = f.array.and_then(|a| Some(RangeRef::new(a.start.offset(dr, dc)?, a.end.offset(dr, dc)?)));
                                 return Some(std::sync::Arc::new(moved));
                             }
-                            let moved =
-                                gridcraft_formula::adjust::shift_relative(e, dest.row as i64 - sc.row as i64, dest.col as i64 - sc.col as i64);
-                            Some(std::sync::Arc::new(Formula::from_expr(moved)))
+                            f.parsed()?;
+                            Some(std::sync::Arc::new(f.moved(dest.row as i64 - sc.row as i64, dest.col as i64 - sc.col as i64)))
                         };
                         if link {
                             let sheet_prefix = if dest_sheet == clip.sheet && same_doc {
@@ -1200,13 +1196,19 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
                 Some(a) if on_target => super::sheet::map_range(a, e),
                 a => a,
             };
-            (new != *expr || array != f.array)
-                .then(|| (*c, Formula { text: gridcraft_formula::print(&new), expr: Some(std::sync::Arc::new(new)), array }))
+            (new != *expr || array != f.array).then(|| {
+                let mut nf = Formula::from_expr(new);
+                nf.array = array;
+                let key = gridcraft_model::FormulaSharer::key(*c, &nf);
+                (*c, nf, key)
+            })
         });
+        // Formulas that were copies of one another mostly still are: share them again.
+        let mut sharer = gridcraft_model::FormulaSharer::default();
         let Some(sheet) = wb.sheet_mut(si) else { continue };
-        for (c, nf) in adjusted {
+        for (c, nf, key) in adjusted {
             if let Some(cell) = sheet.cells.get_mut(c) {
-                cell.formula = Some(std::sync::Arc::new(nf));
+                cell.formula = Some(sharer.share_keyed(si, c, nf, key));
             }
         }
     }

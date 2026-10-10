@@ -58,6 +58,7 @@ pub fn open_bytes_with_password(name: &str, bytes: &[u8], password: Option<&str>
     if gridcraft_xlsx::sniff(bytes) != gridcraft_xlsx::Format::Encrypted {
         let (mut wb, warnings) = open_plain(name, bytes)?;
         fit_imported_rows(&mut wb);
+        share_formulas(&mut wb);
         return Ok((wb, warnings));
     }
     // A scheme no password opens is said straight away, rather than after asking for one.
@@ -72,6 +73,7 @@ pub fn open_bytes_with_password(name: &str, bytes: &[u8], password: Option<&str>
     }
     let (mut wb, mut warnings) = open_plain(name, &plain)?;
     fit_imported_rows(&mut wb);
+    share_formulas(&mut wb);
     warnings.insert(0, DECRYPTED_NOTICE.into());
     Ok((wb, warnings))
 }
@@ -95,6 +97,30 @@ fn fit_imported_rows(wb: &mut Workbook) {
                 && let Some(sh) = wb.sheet_mut(si)
             {
                 sh.rows.entry(row).or_default().size = Some(before);
+            }
+        }
+    }
+}
+
+/// Shares the formulas of a loaded workbook that are the same relative to their cells (filled
+/// blocks): many files don't mark them, and a filled block then parses once and is held once.
+/// The keys are worked out on every processor.
+fn share_formulas(wb: &mut Workbook) {
+    for si in 0..wb.sheets.len() {
+        let Some(sh) = wb.sheets.get(si) else { continue };
+        let formulas: Vec<(gridcraft_core::CellRef, std::sync::Arc<gridcraft_model::Formula>)> =
+            sh.cells.iter().filter_map(|(c, cell)| cell.formula.clone().map(|f| (c, f))).collect();
+        if formulas.len() < 2 {
+            continue;
+        }
+        let keys = gridcraft_calc::par::filter_map(&formulas, |(c, f)| Some(gridcraft_model::FormulaSharer::key(*c, f)));
+        let mut sharer = gridcraft_model::FormulaSharer::default();
+        let Some(sheet) = wb.sheet_mut(si) else { continue };
+        for ((c, f), key) in formulas.into_iter().zip(keys) {
+            if let Some(shared) = sharer.share_existing(si, c, &f, key)
+                && let Some(cell) = sheet.cells.get_mut(c)
+            {
+                cell.formula = Some(shared);
             }
         }
     }
