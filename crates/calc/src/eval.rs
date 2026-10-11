@@ -79,6 +79,12 @@ pub trait Host {
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
     }
+    /// Counts a read of a block (trimmed as [`Evaluator::area_value`] trims it) that an aggregate
+    /// could walk with [`Host::visit_range`]: `true` when the host holds a shared array for it,
+    /// or will build one on this read, so [`Host::range_array`] is the cheaper way to read it.
+    fn share_range(&mut self, _sheet: usize, _range: RangeRef) -> bool {
+        false
+    }
     /// A block as an array (`range` already trimmed and within [`MAX_CELLS`]). Hosts can hand
     /// every formula that reads the same range the same shared array.
     fn range_array(&mut self, sheet: usize, range: RangeRef) -> Value {
@@ -201,14 +207,19 @@ impl<'h> Evaluator<'h> {
         if a.range.is_single() {
             return self.host.cell_value(a.sheet, a.range.start);
         }
-        // A reference keeps its size, so the array has its shape and its blanks count
-        // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`).
-        let cells = u64::from(a.range.height()) * u64::from(a.range.width());
-        let range = if cells > FULL_SIZE_CELLS { self.trim(a) } else { a.range };
+        let range = self.array_range(a);
         if u64::from(range.height()) * u64::from(range.width()) > MAX_CELLS {
             return Value::Error(CellError::Num);
         }
         self.host.range_array(a.sheet, range)
+    }
+
+    /// The block [`Evaluator::area_value`] reads for `a`. A reference keeps its size, so the array
+    /// has its shape and its blanks count (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`); only a huge
+    /// one is trimmed to the used range.
+    fn array_range(&mut self, a: &Area) -> RangeRef {
+        let cells = u64::from(a.range.height()) * u64::from(a.range.width());
+        if cells > FULL_SIZE_CELLS { self.trim(a) } else { a.range }
     }
 
     /// Trims the bottom/right of an area to the sheet's used range (keeps the top-left so
@@ -912,7 +923,13 @@ impl<'h> Evaluator<'h> {
 
     /// Adds one area to `acc`; `Err` is the result the function ends with.
     fn aggregate_area(&mut self, kind: Agg, a: &Area, acc: &mut Acc) -> Result<(), Ev> {
-        if !a.range.is_single() {
+        // A range many formulas aggregate (`SUM(A:A)` filled down) is read once as a shared
+        // array; other ranges are walked in place.
+        let shared = !a.range.is_single() && {
+            let range = self.array_range(a);
+            self.host.share_range(a.sheet, range)
+        };
+        if !a.range.is_single() && !shared {
             let mut error = None;
             let walked = self.host.visit_range(a.sheet, a.range, &mut |v| match acc.add_cell(kind, v) {
                 Ok(()) => true,

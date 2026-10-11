@@ -1114,6 +1114,38 @@ fn sum_count_average_follow_edits_inside_the_range() {
 }
 
 #[test]
+fn aggregates_over_a_shared_range_match_the_walked_one() {
+    // The first SUM(A:A) walks the column in place; the later ones read the pass's shared array.
+    // Both must treat text, logicals, blanks and errors alike.
+    let mut t = T::new();
+    for r in 1..=200u32 {
+        let v = match r % 5 {
+            0 => Value::from("text"),
+            1 => Value::Bool(true),
+            2 => continue,
+            _ => Value::Number(f64::from(r)),
+        };
+        t.wb.sheet_mut(0).unwrap().cells.set(c(&format!("A{r}")), Cell::value(v));
+    }
+    let formulas = ["=SUM(A:A)", "=COUNT(A:A)", "=AVERAGE(A:A)", "=SUM(A1:A200)"];
+    t.load((1..=50).flat_map(|r| formulas.iter().enumerate().map(move |(i, f)| (format!("{}{r}", ["C", "D", "E", "F"][i]), f.to_string()))));
+    let want_sum: f64 = (1..=200).filter(|r| matches!(r % 5, 3 | 4)).map(f64::from).sum();
+    let want_count = (1..=200).filter(|r| matches!(r % 5, 3 | 4)).count() as f64;
+    for r in 1..=50 {
+        assert_eq!(t.num(&format!("C{r}")), want_sum, "C{r}");
+        assert_eq!(t.num(&format!("D{r}")), want_count, "D{r}");
+        assert_eq!(t.num(&format!("E{r}")), want_sum / want_count, "E{r}");
+        assert_eq!(t.num(&format!("F{r}")), want_sum, "F{r}");
+    }
+    // An error in the range is the result of every one of them.
+    t.set("A7", "=1/0");
+    for r in [1, 2, 50] {
+        assert_eq!(t.get(&format!("C{r}")), Value::Error(CellError::Div0), "C{r}");
+        assert_eq!(t.get(&format!("F{r}")), Value::Error(CellError::Div0), "F{r}");
+    }
+}
+
+#[test]
 fn visit_range_declines_when_a_formula_in_the_block_spills_into_it() {
     // The sheet: D1 = SEQUENCE(3) and D4 = 10, and D1 has not been calculated yet when the
     // block D1:D5 is read.
@@ -1488,4 +1520,62 @@ fn clearing_a_far_blocker_unblocks_a_spill() {
     t.calc.rebuild(&t.wb);
     t.set("A90", "");
     assert_eq!(t.num("A90"), 90.0);
+}
+
+#[test]
+fn relative_names_in_shared_formulas() {
+    // A filled column of `=Left*2` shares one parse; each copy's `Left` is the cell to the left
+    // of that copy, not of the formula it was filled from.
+    let mut t = T::new();
+    t.wb.names.push(gridcraft_model::DefinedName {
+        name: "Left".into(),
+        scope: None,
+        formula: "Sheet1!XFD1".into(),
+        comment: String::new(),
+        hidden: false,
+    });
+    let n = 300;
+    let base = Formula::new("Left*2");
+    {
+        let sh = t.wb.sheet_mut(0).unwrap();
+        for r in 1..=n {
+            sh.cells.set(c(&format!("A{r}")), Cell::value(Value::Number(f64::from(r))));
+            sh.cells.set(c(&format!("B{r}")), Cell::formula(base.moved(i64::from(r) - 1, 0)));
+        }
+    }
+    assert!(t.wb.sheet(0).unwrap().cell(c("B150")).unwrap().formula.as_ref().unwrap().is_shared());
+    t.calc.rebuild(&t.wb);
+    t.calc.recalc_all(&mut t.wb);
+    for r in [1, 2, 150, n] {
+        assert_eq!(t.num(&format!("B{r}")), f64::from(r) * 2.0, "B{r}");
+    }
+    t.set("A150", "1000");
+    assert_eq!(t.num("B150"), 2000.0);
+    assert_eq!(t.num("B151"), 302.0);
+}
+
+#[test]
+fn xlookup_references_over_an_indexed_table_on_several_threads() {
+    // 600 formulas read the same 600-row table: it is shared and indexed, and the level is
+    // large enough to run on worker threads. Each returns a reference that SUM reads through.
+    let n = 600;
+    for threads in [1, 4] {
+        let mut t = T::new();
+        t.wb.calc.threads = threads;
+        let mut cells = Vec::new();
+        for r in 1..=n {
+            cells.push((format!("A{r}"), format!("=\"k\"&{r}")));
+            cells.push((format!("B{r}"), format!("={r}")));
+            cells.push((format!("C{r}"), format!("=SUM(B$1:XLOOKUP(\"k\"&ROW(),A$1:A${n},B$1:B${n}))")));
+        }
+        t.load(cells);
+        let tri = |r: u32| f64::from(r * (r + 1) / 2);
+        for r in [1, 10, 299, n] {
+            assert_eq!(t.num(&format!("C{r}")), tri(r), "C{r}, {threads} threads");
+        }
+        t.set("B10", "0");
+        assert_eq!(t.num("C9"), tri(9), "{threads} threads");
+        assert_eq!(t.num("C10"), tri(10) - 10.0, "{threads} threads");
+        assert_eq!(t.num(&format!("C{n}")), tri(n) - 10.0, "{threads} threads");
+    }
 }

@@ -29,7 +29,9 @@ fn file_form(cache: &mut FileExprs, shared: std::sync::Arc<Expr>) -> &(std::sync
 /// once (the conversion doesn't touch references) and prints it moved to the copy's cell.
 pub fn to_file_shared(f: &Formula, cache: &mut FileExprs) -> String {
     let Some((shared, (r, c))) = f.parsed() else { return f.text.clone() };
-    if (r, c) == (0, 0) {
+    // A reference the copy moved off the sheet is `#REF!`, and a spill of one is written as the
+    // bare error, not `ANCHORARRAY(#REF!)`: such (rare) copies are converted on their own.
+    if (r, c) == (0, 0) || f.text.contains("#REF!") {
         return to_file(f);
     }
     let (_, file, _) = file_form(cache, shared);

@@ -1,6 +1,6 @@
 # Target-app parity: GridCraft vs Microsoft Excel
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-11 · **Change:** minor (Performance: recalc order and chain length; shared ranges and lookup indexes; multi-threaded recalc; background recalculation; memory and bulk edits; shared formulas; large XLSX files; measured with the `perf` example) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** minor (Performance #205 rebased onto main: iterative calculation runs on the topological, non-recursive recalc; earlier: recalc order and chain length, shared ranges and lookup indexes, multi-threaded and background recalc, memory and bulk edits, shared formulas, large XLSX files) · **Target:** Microsoft Excel (Microsoft 365)
 
 This is the authoritative parity assessment. [`ROADMAP.md`](../ROADMAP.md) summarizes it,
 [`gaps.md`](gaps.md) lists every shortfall, and the area checklists hold the detail:
@@ -346,6 +346,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Performance (#205) rebased onto main: iterative calculation (circular references with Maximum Iterations / Maximum Change) runs on the topological, non-recursive recalc, one thread while iterating; lookups keep Excel's bisection with the per-recalc exact-match index; no score change |
 | 2026-10-11 | minor | Performance: XLSX files open with their cached values (formulas without one, array anchors, volatile formulas and `fullCalcOnLoad` files are recalculated); large parts compress faster on save |
 | 2026-10-11 | minor | Performance: large XLSX files open 1.9× faster with 28% less memory (streaming reader reuses its elements, rows stored at once, filled columns read without parsing) and full recalculation writes results back in order |
 | 2026-10-11 | minor | Performance: shared formulas: copied and filled formulas, XLSX shared formulas and repeated formulas in loaded files share one parsed expression (peak memory of the `scale` benchmark 1.0 → 0.70 GB) |

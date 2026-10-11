@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (recalc order: Kahn's algorithm, no recursion) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (recalc: Kahn order without recursion, shared ranges and lookup indexes, threads, background recalc, shared formulas, iterative calculation on the new pass; #205) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -55,6 +55,9 @@ including tests, 2026-10-10.
    nodes for range dependents), evaluates in topological order (Kahn's algorithm over the dirty
    set; a formula that reads a cell not yet done, through a name, table or INDIRECT, waits on a
    heap stack, so chains have no length limit), spills dynamic arrays and reports `#SPILL!`/cycles.
+   With iterative calculation on, a read of a formula that waits for its reader gives its previous
+   value instead of `#CIRC!`, and after the pass the loops and what depends on them are evaluated
+   again in plan order (Gauss-Seidel, one thread) until Maximum Change or Maximum Iterations.
    Volatile functions are always dirty. Within a pass, a range read more than once is built once
    and shared, and lookup functions index a shared range (`LookupCache`, reached through
    `Ctx::lookup_cache`) so repeated searches are O(1) or O(log n). The plan is split into levels
@@ -102,6 +105,7 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Iterative calculation on the non-recursive pass (rebase of #205 onto main) |
 | 2026-10-11 | minor | Opening keeps the file's cached values |
 | 2026-10-11 | minor | XLSX reader: element reuse, row-at-once storage, filled columns without parsing |
 | 2026-10-11 | minor | Shared formulas |
