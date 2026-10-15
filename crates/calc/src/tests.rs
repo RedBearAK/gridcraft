@@ -266,6 +266,47 @@ fn iterative_calculation_stops_once_changes_are_below_maximum_change() {
 }
 
 #[test]
+fn iterative_calculation_follows_every_kind_of_read_of_a_loop() {
+    // K1 and K2 settle at 10. Formulas outside the loop read it through INDIRECT, a range read
+    // many times (shared, with a lookup over it) and one another: each is evaluated again on
+    // every pass, and ends at the loop's final values rather than its first pass's.
+    // Entered without calculating, so the loop starts from blank: entering the cells one by
+    // one would settle it first, and the first pass would already read its final values.
+    let mut t = T::iterative(100, 1e-9);
+    let mut cells = vec![
+        ("K1".to_string(), "=(K2+10)/2".to_string()),
+        ("K2".into(), "=K1".into()),
+        ("M1".into(), "=INDIRECT(\"K\"&1)*2".into()),
+        ("M2".into(), "=M1+1".into()),
+        ("M3".into(), "=INDEX(K1:K100,2)".into()),
+    ];
+    cells.extend((3..=8).map(|row| (format!("S{row}"), format!("=SUM(K1:K100)*{row}"))));
+    for (at, f) in &cells {
+        t.wb.sheet_mut(0).unwrap().cells.set(c(at), Cell::formula(Formula::new(f)));
+    }
+    t.calc.recalc_all(&mut t.wb);
+    let near = |t: &T, at: &str, want: f64| assert!((t.num(at) - want).abs() < 1e-6, "{at} = {}", t.num(at));
+    near(&t, "K1", 10.0);
+    near(&t, "M1", 20.0);
+    near(&t, "M2", 21.0);
+    near(&t, "M3", 10.0);
+    for row in 3..=8 {
+        near(&t, &format!("S{row}"), 20.0 * row as f64);
+    }
+    // Through a spill seeded from the loop: only a spilled cell, or a range of them, is read.
+    // Editing the loop keeps the spill's shape, so nothing but iteration recalculates the readers.
+    t.set("P1", "=SEQUENCE(2,1,K1)");
+    t.set("R1", "=P2*2");
+    t.set("R2", "=SUM(P2:P3)*2");
+    near(&t, "R1", 22.0);
+    t.set("K1", "=(K2+20)/2");
+    near(&t, "K1", 20.0);
+    near(&t, "P2", 21.0);
+    near(&t, "R1", 42.0);
+    near(&t, "R2", 42.0);
+}
+
+#[test]
 fn iterative_calculation_of_text_and_errors() {
     let mut t = T::iterative(100, 0.001);
     t.set("A1", "=IF(ISTEXT(A1),A1&\"\",\"go\")");
@@ -1647,22 +1688,36 @@ fn random_acyclic_sheet(seed: u64, rows: u32, cols: u32) -> (Vec<(String, String
         let mut terms = Vec::new();
         for _ in 0..1 + xorshift(&mut s) % 3 {
             let (pr, pc) = pick(&mut s);
-            terms.push(match xorshift(&mut s) % 4 {
+            // A column range ending at (pr, pc), if every cell in it was entered before.
+            let top = pr.saturating_sub((xorshift(&mut s) % 4) as u32);
+            let range = (top..=pr).all(|rr| rank.get(&(rr, pc)).is_some_and(|&k| k < i)).then(|| (a1(top, pc), a1(pr, pc)));
+            terms.push(match xorshift(&mut s) % 7 {
                 0 => format!("INDIRECT(\"{}\")", a1(pr, pc)),
                 1 => {
                     let name = format!("N{}", names.len());
                     names.push((name.clone(), format!("Sheet1!${}${}", char::from(b'A' + pc as u8), pr + 1)));
                     name
                 }
-                2 => {
-                    // A column range ending at the cell, if every cell in it was entered before.
-                    let top = pr.saturating_sub((xorshift(&mut s) % 4) as u32);
-                    if (top..=pr).all(|rr| rank.get(&(rr, pc)).is_some_and(|&k| k < i)) {
-                        format!("SUM({}:{})", a1(top, pc), a1(pr, pc))
-                    } else {
-                        a1(pr, pc)
+                2 => match &range {
+                    Some((a, b)) => format!("SUM({a}:{b})"),
+                    None => a1(pr, pc),
+                },
+                // A defined name over the range.
+                3 => match &range {
+                    Some(_) => {
+                        let name = format!("R{}", names.len());
+                        let col = char::from(b'A' + pc as u8);
+                        names.push((name.clone(), format!("Sheet1!${col}${}:${col}${}", top + 1, pr + 1)));
+                        format!("SUM({name})")
                     }
-                }
+                    None => a1(pr, pc),
+                },
+                // OFFSET with a computed offset (a dynamic reference).
+                4 => format!("N(OFFSET($A$1,{pr}+0*ROW(),{pc}))"),
+                5 => match &range {
+                    Some((a, b)) => format!("INDEX({a}:{b},1)"),
+                    None => a1(pr, pc),
+                },
                 _ => a1(pr, pc),
             });
         }

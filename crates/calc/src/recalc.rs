@@ -7,8 +7,8 @@
 //! transitive closure of dependents; it is evaluated in topological order, with on-demand
 //! evaluation as a safety net for dynamic references. Cycles produce `#CIRC!` unless iterative
 //! calculation is on: then a formula read while it is being evaluated gives its previous value,
-//! and the formulas on and after the loop are evaluated again until it settles
-//! (`PassHost::iterate_loops`).
+//! and the formulas that read a previous value, directly or through others, are evaluated again
+//! until the loop settles (`PassHost::iterate_loops`).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -636,6 +636,11 @@ struct PassHost<'a> {
     prev: HashMap<Key, Value>,
     /// Formulas found on a circular reference (when iterating).
     members: HashSet<Key>,
+    /// Iterative calculation: formulas whose result came from a previous value, read on a loop
+    /// or through another such formula. Only they are evaluated again on the next pass.
+    tainted: HashSet<Key>,
+    /// Whether the formula being evaluated has read a previous value so far (when iterating).
+    taint: bool,
 }
 
 /// How often a range has been read in a pass, and its shared array once it is shared.
@@ -643,6 +648,8 @@ struct PassHost<'a> {
 struct SharedRange {
     reads: u32,
     array: Option<Arc<Array>>,
+    /// Iterative calculation: the array holds a value that came from a previous value.
+    tainted: bool,
 }
 
 /// Ranges smaller than this are rebuilt for every read: sharing them saves little.
@@ -733,6 +740,8 @@ impl<'a> PassHost<'a> {
             iterate: false,
             prev: HashMap::default(),
             members: HashSet::default(),
+            tainted: HashSet::default(),
+            taint: false,
         }
     }
 
@@ -796,6 +805,7 @@ impl<'a> PassHost<'a> {
     /// nothing) when it read pending cells, listed in `blocked`.
     fn attempt(&mut self, k: Key) -> bool {
         self.blocked.clear();
+        self.taint = false;
         // Borrowed, not cloned: the formulas of a filled block share one expression, and cloning
         // it from every thread would contend on its reference count.
         let exprs = self.exprs;
@@ -859,7 +869,22 @@ impl<'a> PassHost<'a> {
             _ => v,
         };
         self.own.results.insert(k, v);
+        if self.iterate {
+            if self.taint {
+                self.tainted.insert(k);
+            } else {
+                self.tainted.remove(&k);
+            }
+        }
         true
+    }
+
+    /// Iterative calculation: reading done formula `k` (or a cell it spilled over) passes on its
+    /// taint, so the reader is evaluated again on the next pass too.
+    fn note_read(&mut self, k: Key) {
+        if self.iterate && self.tainted.contains(&k) {
+            self.taint = true;
+        }
     }
 
     /// Reading pending cell `k` from the formula being evaluated, and the value it reads for now.
@@ -877,6 +902,7 @@ impl<'a> PassHost<'a> {
             self.cycles.push(k);
             return Value::Error(CellError::Circ);
         }
+        self.taint = true;
         // The formulas set aside from `k` up wait for one another: the loop, whose changes decide
         // when iteration stops (formulas only queued between them aren't on it).
         match self.stack.iter().rposition(|s| *s == k) {
@@ -899,25 +925,13 @@ impl<'a> PassHost<'a> {
     }
 
     /// Iterative calculation, after a first pass over `order` that met circular references. The
-    /// formulas on the loops and those that depend on them are evaluated again in the same order,
-    /// each pass starting from the last one's values and reading what it has already produced
-    /// (Gauss-Seidel), until no formula on a loop changes by `max_change` or more, or after
-    /// `max_iterations` passes in all. Returns the number of passes.
-    fn iterate_loops(&mut self, graph: &Graph, order: &[Key], max_iterations: u32, max_change: f64) -> u32 {
-        // What the loops reach, through static precedents and through any dynamic reference.
-        let mut reach: HashSet<Key> = HashSet::default();
-        let mut queue: Vec<Key> = self.members.iter().copied().collect();
-        queue.extend(graph.dynamic.iter().copied());
-        let mut deps = Vec::new();
-        while let Some(k) = queue.pop() {
-            if !reach.insert(k) {
-                continue;
-            }
-            deps.clear();
-            graph.dependents(k.0, k.1, &mut deps);
-            queue.extend(deps.iter().filter(|d| !reach.contains(d)));
-        }
-        let again: Vec<Key> = order.iter().copied().filter(|k| reach.contains(k) && self.exprs.contains_key(k)).collect();
+    /// formulas that read a previous value (the loops and what depends on them, through any kind
+    /// of reference) are evaluated again in the same order, each pass starting from the last
+    /// one's values and reading what it has already produced (Gauss-Seidel), until no formula on
+    /// a loop changes by `max_change` or more, or after `max_iterations` passes in all. Returns
+    /// the number of passes.
+    fn iterate_loops(&mut self, order: &[Key], max_iterations: u32, max_change: f64) -> u32 {
+        let again: Vec<Key> = order.iter().copied().filter(|k| self.tainted.contains(k)).collect();
         // Bounds the work whatever Maximum Iterations says.
         let max_passes = u32::try_from(MAX_ITERATION_WORK / again.len().max(1)).unwrap_or(u32::MAX).max(1);
         let mut passes = 1u32;
@@ -1119,20 +1133,27 @@ impl Host for PassHost<'_> {
     fn cell_value(&mut self, sheet: usize, c: CellRef) -> Value {
         let k = (sheet, c);
         if let Some(v) = self.result(&k) {
-            return v.clone();
+            let v = v.clone();
+            self.note_read(k);
+            return v;
         }
         if self.is_pending(&k) {
             // Not done yet: the value is a placeholder, the reading formula is evaluated again.
             return self.wait_for(k);
         }
         // A cell covered by a spill computed in this pass.
-        for (anchor, arr) in self.all_spills() {
+        let spilled = self.all_spills().find_map(|(anchor, arr)| {
             if anchor.0 == sheet && c.row >= anchor.1.row && c.col >= anchor.1.col {
                 let (dr, dc) = ((c.row - anchor.1.row) as usize, (c.col - anchor.1.col) as usize);
                 if dr < arr.rows && dc < arr.cols {
-                    return arr.get(dr, dc).cloned().unwrap_or_default();
+                    return Some((*anchor, arr.get(dr, dc).cloned().unwrap_or_default()));
                 }
             }
+            None
+        });
+        if let Some((anchor, v)) = spilled {
+            self.note_read(anchor);
+            return v;
         }
         self.wb.sheet(sheet).map(|s| s.value(c)).unwrap_or_default()
     }
@@ -1167,7 +1188,7 @@ impl Host for PassHost<'_> {
                 *slot = v;
             }
         }
-        let new: Vec<(usize, Value)> = self
+        let new: Vec<(Key, usize, Value)> = self
             .all_spills()
             .filter(|(a, _)| a.0 == sheet)
             .flat_map(|(a, arr)| {
@@ -1177,6 +1198,7 @@ impl Host for PassHost<'_> {
                         let c = CellRef::new(a.1.row.saturating_add(r as u32), a.1.col.saturating_add(cc as u32));
                         if c != a.1 && range.contains(c) {
                             v.push((
+                                *a,
                                 (c.row - range.start.row) as usize * w + (c.col - range.start.col) as usize,
                                 arr.get(r, cc).cloned().unwrap_or_default(),
                             ));
@@ -1186,7 +1208,8 @@ impl Host for PassHost<'_> {
                 v
             })
             .collect();
-        for (i, v) in new {
+        for (anchor, i, v) in new {
+            self.note_read(anchor);
             if let Some(slot) = out.get_mut(i) {
                 *slot = v;
             }
@@ -1240,18 +1263,26 @@ impl Host for PassHost<'_> {
         let cells = h.saturating_mul(w);
         let mut share = false;
         if cells >= MIN_SHARED_CELLS {
-            if let Some(a) = self.base.and_then(|b| b.ranges.get(&(sheet, range))).and_then(|s| s.array.as_ref()) {
+            if let Some(s) = self.base.and_then(|b| b.ranges.get(&(sheet, range)))
+                && let Some(a) = &s.array
+            {
+                self.taint |= s.tainted;
                 return Value::Array(Arc::clone(a));
             }
             let slot = self.own.ranges.entry((sheet, range)).or_default();
             if let Some(a) = &slot.array {
-                return Value::Array(Arc::clone(a));
+                let a = Arc::clone(a);
+                self.taint |= slot.tainted;
+                return Value::Array(a);
             }
             slot.reads = slot.reads.saturating_add(1);
             share = slot.reads >= 2 && self.own.shared_cells.saturating_add(cells) <= SHARED_CELLS_BUDGET;
         }
         let (blocked, cycles) = (self.blocked.len(), self.circular_reads);
+        let outer_taint = std::mem::replace(&mut self.taint, false);
         let data = self.range_values(sheet, range);
+        let tainted = self.taint;
+        self.taint |= outer_taint;
         let Some(array) = Array::new(h, w, data) else { return Value::Error(CellError::Value) };
         let array = Arc::new(array);
         if share
@@ -1260,6 +1291,7 @@ impl Host for PassHost<'_> {
             && let Some(slot) = self.own.ranges.get_mut(&(sheet, range))
         {
             slot.array = Some(Arc::clone(&array));
+            slot.tainted = tainted;
             self.own.shared_cells += cells;
         }
         Value::Array(array)
@@ -1621,7 +1653,7 @@ impl Calc {
                 }
                 if host.iterate && !host.members.is_empty() {
                     let order: Vec<Key> = plan.levels().flatten().chain(plan.rest()).copied().collect();
-                    let passes = host.iterate_loops(&self.graph, &order, wb.calc.max_iterations, wb.calc.max_change);
+                    let passes = host.iterate_loops(&order, wb.calc.max_iterations, wb.calc.max_change);
                     if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                         eprintln!("  iterative calculation: {passes} passes over {} loop formulas", host.members.len());
                     }
