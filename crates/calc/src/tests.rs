@@ -1579,3 +1579,139 @@ fn xlookup_references_over_an_indexed_table_on_several_threads() {
         assert_eq!(t.num(&format!("C{n}")), tri(n) - 10.0, "{threads} threads");
     }
 }
+
+#[test]
+fn formulas_queued_together_are_not_a_cycle() {
+    // E1 reads A2 and A3 before either is done; A3 reads A2. Both are queued behind E1, and A3
+    // reading A2 while A2 only waits its turn is not a circular reference.
+    let mut t = T::new();
+    t.set("D1", "1");
+    t.set("A2", "=D1");
+    t.set("A3", "=A2+1");
+    t.set("E1", "=INDIRECT(\"A2\")+INDIRECT(\"A3\")");
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!(t.num("E1"), 3.0);
+    assert!(t.calc.circular.is_empty());
+    // The same through a defined name over a chain: a SUM of three cells.
+    let mut t = T::new();
+    t.wb.names.push(gridcraft_model::DefinedName {
+        name: "Block".into(),
+        scope: None,
+        formula: "Sheet1!$A$2:$A$4".into(),
+        comment: String::new(),
+        hidden: false,
+    });
+    t.set("C1", "=SUM(Block)");
+    t.set("A2", "=1");
+    t.set("A3", "=A2+1");
+    t.set("A4", "=A3+1");
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!(t.num("C1"), 6.0);
+    assert!(t.calc.circular.is_empty());
+}
+
+fn xorshift(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
+
+fn a1(row: u32, col: u32) -> String {
+    format!("{}{}", char::from(b'A' + col as u8), row + 1)
+}
+
+/// An acyclic sheet whose formulas read cells entered before them, placed anywhere (so row-major
+/// order isn't a topological order) and mostly recent ones (so they read chains of one another),
+/// directly, through ranges, defined names and INDIRECT. Returns the cells in entry order and the
+/// names.
+fn random_acyclic_sheet(seed: u64, rows: u32, cols: u32) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut s = seed.max(1);
+    let mut cells: Vec<(u32, u32)> = (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).collect();
+    for i in (1..cells.len()).rev() {
+        let j = (xorshift(&mut s) % (i as u64 + 1)) as usize;
+        cells.swap(i, j);
+    }
+    let rank: std::collections::HashMap<(u32, u32), usize> = cells.iter().enumerate().map(|(i, c)| (*c, i)).collect();
+    let mut out = Vec::new();
+    let mut names = Vec::new();
+    for (i, &(r, c)) in cells.iter().enumerate() {
+        if i < 20 || xorshift(&mut s).is_multiple_of(5) {
+            out.push((a1(r, c), format!("{}", xorshift(&mut s) % 100)));
+            continue;
+        }
+        let pick = |s: &mut u64| {
+            let back = if xorshift(s).is_multiple_of(4) { xorshift(s) % i as u64 } else { 1 + xorshift(s) % 6 };
+            cells[i - back.max(1) as usize]
+        };
+        let mut terms = Vec::new();
+        for _ in 0..1 + xorshift(&mut s) % 3 {
+            let (pr, pc) = pick(&mut s);
+            terms.push(match xorshift(&mut s) % 4 {
+                0 => format!("INDIRECT(\"{}\")", a1(pr, pc)),
+                1 => {
+                    let name = format!("N{}", names.len());
+                    names.push((name.clone(), format!("Sheet1!${}${}", char::from(b'A' + pc as u8), pr + 1)));
+                    name
+                }
+                2 => {
+                    // A column range ending at the cell, if every cell in it was entered before.
+                    let top = pr.saturating_sub((xorshift(&mut s) % 4) as u32);
+                    if (top..=pr).all(|rr| rank.get(&(rr, pc)).is_some_and(|&k| k < i)) {
+                        format!("SUM({}:{})", a1(top, pc), a1(pr, pc))
+                    } else {
+                        a1(pr, pc)
+                    }
+                }
+                _ => a1(pr, pc),
+            });
+        }
+        out.push((a1(r, c), format!("=MOD({},1000)", terms.join("+"))));
+    }
+    (out, names)
+}
+
+#[test]
+fn full_recalc_matches_entering_cells_one_by_one_at_any_thread_count() {
+    // `GRIDCRAFT_ORDER_FUZZ_SEEDS=50` soaks it.
+    let seeds: u64 = std::env::var("GRIDCRAFT_ORDER_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    for seed in 1..=seeds {
+        let (cells, names) = random_acyclic_sheet(seed * 7919, 400, 8);
+        let book = |threads: u32| {
+            let mut t = T::new();
+            t.wb.calc.multi_threaded = threads > 1;
+            t.wb.calc.threads = threads;
+            for (name, formula) in &names {
+                t.wb.names.push(gridcraft_model::DefinedName {
+                    name: name.clone(),
+                    scope: None,
+                    formula: formula.clone(),
+                    comment: String::new(),
+                    hidden: false,
+                });
+            }
+            t
+        };
+        // Reference: entered in order, each formula reading only finished cells.
+        let mut want = book(1);
+        for (at, input) in &cells {
+            want.set(at, input);
+        }
+        for threads in [1, 8] {
+            let mut t = book(threads);
+            for (at, input) in &cells {
+                let cell = if input.starts_with('=') {
+                    Cell::formula(Formula::new(input))
+                } else {
+                    Cell::value(gridcraft_core::parse::parse_input(input, t.wb.date_system).value)
+                };
+                t.wb.sheet_mut(0).unwrap().cells.set(c(at), cell);
+            }
+            t.calc.rebuild(&t.wb);
+            t.calc.recalc_all(&mut t.wb);
+            let wrong: Vec<_> =
+                cells.iter().filter(|(at, _)| t.get(at) != want.get(at)).map(|(at, f)| (at, f, t.get(at), want.get(at))).take(5).collect();
+            assert!(wrong.is_empty(), "seed {seed}, {threads} threads: {wrong:?}");
+        }
+    }
+}

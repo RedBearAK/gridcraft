@@ -610,8 +610,10 @@ struct PassHost<'a> {
     /// The main thread's layer, when this host is a worker thread on a multi-threaded level.
     base: Option<&'a Layer>,
     own: Layer,
-    /// Formulas set aside until the pending cells they read are done (see [`PassHost::settle`]).
-    in_stack: HashSet<Key>,
+    /// Formulas being evaluated, or set aside until the pending cells they read are done (see
+    /// [`PassHost::settle`]): the formula being evaluated and those waiting for it. Reading one
+    /// of these is a circular reference; a formula only queued on the stack isn't one of them.
+    active: HashSet<Key>,
     /// Pending cells the formula being evaluated read before they were done.
     blocked: Vec<Key>,
     /// The formulas set aside by [`PassHost::settle`] (kept to reuse its allocation).
@@ -718,7 +720,7 @@ impl<'a> PassHost<'a> {
             exprs,
             base,
             own: Layer::default(),
-            in_stack: HashSet::default(),
+            active: HashSet::default(),
             blocked: Vec::new(),
             stack: Vec::new(),
             lookups: Default::default(),
@@ -753,8 +755,9 @@ impl<'a> PassHost<'a> {
     /// The value of `root`, evaluating it first if it is pending, together with every pending
     /// formula it turns out to read, without recursing: a formula that reads a pending cell is
     /// set aside on a stack, the cells it read go on top, and it is evaluated again once they are
-    /// done. A cell read while it is set aside is part of a cycle (`#CIRC!`). Chains of any length
-    /// cost heap, not call stack.
+    /// done. A cell read while it is set aside is part of a cycle (`#CIRC!`); a cell that is only
+    /// queued on the stack (another formula set aside read it too) is evaluated first instead.
+    /// Chains of any length cost heap, not call stack.
     fn settle(&mut self, root: Key) -> Value {
         if let Some(v) = self.result(&root) {
             return v.clone();
@@ -762,28 +765,29 @@ impl<'a> PassHost<'a> {
         if !self.is_pending(&root) {
             return self.wb.sheet(root.0).map(|s| s.value(root.1)).unwrap_or_default();
         }
-        // Fast path: a formula whose precedents are done (nearly all of them, in `levels`).
-        self.in_stack.insert(root);
         self.stack.clear();
         self.stack.push(root);
-        if self.attempt(root) {
-            self.in_stack.remove(&root);
-            self.stack.clear();
-            return self.result(&root).cloned().unwrap_or_default();
-        }
-        let mut retry = false;
         while let Some(&k) = self.stack.last() {
-            if retry && self.attempt(k) {
+            // Queued twice (read by two formulas set aside) and done since.
+            if self.result(&k).is_some() || !self.is_pending(&k) {
                 self.stack.pop();
-                self.in_stack.remove(&k);
-            } else {
-                for p in std::mem::take(&mut self.blocked) {
-                    if self.in_stack.insert(p) {
-                        self.stack.push(p);
-                    }
-                }
+                self.active.remove(&k);
+                continue;
             }
-            retry = true;
+            self.active.insert(k);
+            if self.attempt(k) {
+                self.stack.pop();
+                self.active.remove(&k);
+            } else {
+                // `k` stays active, waiting; the cells it read go on top. Everything above it
+                // comes from what it reads, so an active formula is always one the formula on
+                // top is waiting for.
+                let mut blocked = std::mem::take(&mut self.blocked);
+                blocked.dedup();
+                self.stack.extend(blocked.iter().copied());
+                blocked.clear();
+                self.blocked = blocked;
+            }
         }
         self.result(&root).cloned().unwrap_or_default()
     }
@@ -863,7 +867,7 @@ impl<'a> PassHost<'a> {
     /// with iterative calculation its previous value. Otherwise `k` is noted as blocking and the
     /// formula will be evaluated again once `k` is done.
     fn wait_for(&mut self, k: Key) -> Value {
-        if !self.in_stack.contains(&k) {
+        if !self.active.contains(&k) {
             self.blocked.push(k);
             return Value::Empty;
         }
@@ -874,9 +878,9 @@ impl<'a> PassHost<'a> {
             return Value::Error(CellError::Circ);
         }
         // The formulas set aside from `k` up wait for one another: the loop, whose changes decide
-        // when iteration stops (with siblings that are only waited on, which settle with it).
+        // when iteration stops (formulas only queued between them aren't on it).
         match self.stack.iter().rposition(|s| *s == k) {
-            Some(i) => self.members.extend(self.stack.get(i..).unwrap_or_default().iter().copied()),
+            Some(i) => self.members.extend(self.stack.get(i..).unwrap_or_default().iter().copied().filter(|s| self.active.contains(s))),
             None => {
                 self.members.insert(k);
             }
@@ -993,11 +997,11 @@ impl<'a> PassHost<'a> {
                     break;
                 }
                 for &k in chunk {
-                    w.in_stack.insert(k);
+                    w.active.insert(k);
                     if !w.attempt(k) {
                         deferred.push(k);
                     }
-                    w.in_stack.remove(&k);
+                    w.active.remove(&k);
                 }
                 report(chunk.len());
             }
