@@ -480,18 +480,23 @@ fn same_content(a: Option<&gridcraft_model::Cell>, b: Option<&gridcraft_model::C
     }
 }
 
-/// Recomputes an automatic row height from its content: the largest font, and wrapped or
-/// multi-line text. Rows with a user-set height keep it.
+/// Recomputes an automatic row height from its content: the largest font, and wrapped text.
+/// Rows with a user-set height keep it.
+///
+/// Line breaks in a cell's text count only when the cell wraps, as in Excel: with Wrap Text off
+/// a multi-line value shows on one line and AutoFit gives a one-line row. (Until 2026-10-15 a
+/// line break grew the row whether or not the cell wrapped, so a sheet whose notes column held
+/// pasted multi-line text had tall rows with nothing visibly tall in them.)
 pub fn auto_row_height(wb: &mut Workbook, si: usize, row: u32) {
     let Some(sh) = wb.sheet(si) else { return };
     if sh.rows.get(&row).is_some_and(|i| i.custom) {
         return;
     }
     let default = sh.default_row_height;
-    // Fast path: rows of default-size, unwrapped, single-line content keep the default height.
+    // Fast path: rows of default-size, unwrapped content keep the default height.
     let plain = sh.cells.row(row, 0, gridcraft_core::MAX_COLS - 1).all(|(_, cell)| {
         let st = wb.styles.get(cell.style);
-        st.font.size <= gridcraft_model::DEFAULT_FONT_SIZE && !st.align.wrap && !cell.value.as_text().is_some_and(|t| t.contains('\n'))
+        st.font.size <= gridcraft_model::DEFAULT_FONT_SIZE && !st.align.wrap
     });
     if plain {
         if sh.rows.get(&row).is_some_and(|i| i.size.is_some())
@@ -514,17 +519,17 @@ pub fn auto_row_height(wb: &mut Workbook, si: usize, row: u32) {
         let line = (size * 1.8).round().max(default * size / gridcraft_model::DEFAULT_FONT_SIZE);
         let mut lines = 1.0f32;
         if !cell.value.is_empty() || cell.formula.is_some() {
-            let text = crate::display::cell_text(wb, sh, CellRef::new(row, c));
-            let explicit = text.lines().count().max(1) as f32;
-            lines = if st.align.wrap {
+            // Only a wrapping cell is laid out over several lines: each explicit line break
+            // starts one, and each line folds at the column width.
+            if st.align.wrap {
+                let text = crate::display::cell_text(wb, sh, CellRef::new(row, c));
                 let w = sh.col_width(c).max(1.0) - 6.0;
-                text.lines()
+                lines = text
+                    .lines()
                     .map(|l| (crate::cmd::format::approx_text_width(l, size, st.font.bold) / w.max(1.0)).ceil().max(1.0))
                     .sum::<f32>()
-                    .max(1.0)
-            } else {
-                explicit
-            };
+                    .max(1.0);
+            }
         } else if st.font.size <= gridcraft_model::DEFAULT_FONT_SIZE {
             continue;
         }

@@ -1139,6 +1139,37 @@ fn rewriting_a_hidden_name_recalculates_its_readers() {
     assert!(after_len > before_len, "the reader of a rewritten hidden name must see the new definition ({before_len} -> {after_len})");
 }
 
+#[test]
+fn line_breaks_grow_a_row_only_when_the_cell_wraps() {
+    // Excel: a cell holding "a\nb" with Wrap Text off displays on one line and AutoFit gives a
+    // one-line row; with Wrap Text on it gets one line per break. Until 2026-10-15 the break grew
+    // the row either way, so a file whose notes column held pasted multi-line text (wrap off, as
+    // generating libraries write it) opened with tall rows and nothing visibly tall in them.
+    // Typing a break (Alt+Enter) turns wrap on, as in Excel, so the unwrapped case comes from a
+    // file, built with the model API and exported without row heights.
+    let text = "first line\n\n\nfourth line";
+    let bytes = {
+        let mut wb = gridcraft_model::Workbook::new();
+        let sh = wb.sheet_mut(0).unwrap();
+        sh.set_value(CellRef::new(1, 1), Value::text(text));
+        gridcraft_xlsx::write_xlsx(&wb).unwrap()
+    };
+    let default_h = gridcraft_model::Workbook::new().active().unwrap().row_height(1);
+    let mut s = Session::new();
+    s.execute("file.open", json!({"name": "notes.xlsx", "base64": crate::io::base64_encode(&bytes)})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(1), default_h, "an unwrapped multi-line cell keeps the default row height on open");
+    // Turning wrap on lays the text out over its lines and the row grows to hold them.
+    s.execute("home.wrapText", json!({"range": "B2", "on": true})).unwrap();
+    let wrapped_h = s.doc().unwrap().wb.active().unwrap().row_height(1);
+    assert!(wrapped_h > default_h * 2.5, "wrapped four-line text grows the row, got {wrapped_h} vs default {default_h}");
+    // Turning it off again returns the row to one line.
+    s.execute("home.wrapText", json!({"range": "B2", "on": false})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(1), default_h, "wrap off: back to a one-line row");
+    // Entering a break by hand wraps the cell (Alt+Enter), so that row does grow.
+    s.execute("cell.set", json!({"cell": "D4", "input": text})).unwrap();
+    assert!(s.doc().unwrap().wb.active().unwrap().row_height(3) > default_h * 2.5, "typed line breaks turn wrap on and grow the row");
+}
+
 #[test] // B — Review Focus 1
 fn open_keeps_custom_height_rows() {
     let mut s = Session::new();
