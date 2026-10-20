@@ -346,7 +346,13 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if let Some(t0) = t0 {
         eprintln!("commit: edit {:?}, {} changed", t0.elapsed(), changed.len());
     }
-    if structural {
+    // A changed defined name is a structural edit whether or not the command said so: formulas
+    // reading a name depend on what it resolves to (its range, or the references in its LAMBDA
+    // body), and those edges are built from the definitions. The name commands set `structural`
+    // themselves; the hidden names that store solver models, scenarios, custom views and scripts
+    // are rewritten by their own commands without it, and a cell can still read them.
+    let names_changed = wb.names != d.wb.names;
+    if structural || names_changed {
         d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
         d.calc.cells_changed(&mut wb, &changed);

@@ -1119,6 +1119,26 @@ fn open_grows_default_height_rows_to_their_font() {
     assert_eq!(s.doc().unwrap().wb.active().unwrap().row_height(0), default_h, "11pt row stays default");
 }
 
+#[test]
+fn rewriting_a_hidden_name_recalculates_its_readers() {
+    // Commands that keep state in hidden defined names (custom views, scenarios, solver models,
+    // scripts) rewrite the name without marking the edit structural. Since formulas reading a
+    // name depend on its definition statically (2026-10-14), `commit` treats any change to the
+    // names as structural so such readers are re-evaluated; before, every name made its formula
+    // volatile, which hid the gap.
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("view.customViews", json!({"save": "first"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "=LEN(_sc_custom_views)"})).unwrap();
+    let before = s.doc().unwrap().wb.active().unwrap().value(CellRef::new(0, 0));
+    let Value::Number(before_len) = before else { panic!("expected a length, got {before:?}") };
+    assert!(before_len > 0.0);
+    s.execute("view.customViews", json!({"save": "second view with a longer name"})).unwrap();
+    let after = s.doc().unwrap().wb.active().unwrap().value(CellRef::new(0, 0));
+    let Value::Number(after_len) = after else { panic!("expected a length, got {after:?}") };
+    assert!(after_len > before_len, "the reader of a rewritten hidden name must see the new definition ({before_len} -> {after_len})");
+}
+
 #[test] // B — Review Focus 1
 fn open_keeps_custom_height_rows() {
     let mut s = Session::new();
