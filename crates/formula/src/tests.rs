@@ -401,3 +401,23 @@ fn formulas_longer_than_excel_allows_are_refused() {
     assert!(text.len() > crate::MAX_FORMULA_LEN);
     assert!(parse(&text).is_ok());
 }
+
+#[test]
+fn printing_shifted_matches_shifting_then_printing() {
+    let formulas = [
+        "A1+$B2+C$3+$D$4",
+        "SUM(A1:B5,$C$1:C10)/COUNT(2:3)+SUM(A:B)+SUM($A:$A)",
+        "Sheet2!A1*'My Sheet'!$B$2+SUM(Sheet1:Sheet3!C3)",
+        "IF(A1>0,{1,2;3,4},\"x\")&TEXT(B1,\"0.0\")",
+        "LET(x,A1,LAMBDA(y,y+x+B1)(C1))+Rate+Table1[Qty]",
+        "A1#+-B2%+@C3:D4",
+        "INDEX(A1:A10,2):B3",
+        "SUM(A1:.E10)+SUM(A1.:.B2)+'My Sheet'!Total",
+    ];
+    for f in formulas {
+        let e = crate::parse(f).unwrap();
+        for (dr, dc) in [(0, 0), (3, 2), (-1, 0), (0, -1), (1_048_000, 0), (5, 16_000)] {
+            assert_eq!(crate::print_shifted(&e, dr, dc), print(&shift_relative(e.clone(), dr, dc)), "{f} by ({dr}, {dc})");
+        }
+    }
+}
