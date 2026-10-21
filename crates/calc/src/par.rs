@@ -106,10 +106,14 @@ mod tests {
     fn filter_map_init_gives_each_thread_its_own_state() {
         let items: Vec<u32> = (0..20_000).collect();
         // Each thread counts the items it has seen; results come back in order either way.
-        let out = super::filter_map_init(&items, || 0u32, |seen, x| {
-            *seen += 1;
-            (x % 3 == 0).then_some(x * 2)
-        });
+        let out = super::filter_map_init(
+            &items,
+            || 0u32,
+            |seen, x| {
+                *seen += 1;
+                (x % 3 == 0).then_some(x * 2)
+            },
+        );
         let want: Vec<u32> = items.iter().filter(|x| *x % 3 == 0).map(|x| x * 2).collect();
         assert_eq!(out, want);
     }
