@@ -45,7 +45,7 @@ use gridcraft_core::{Array, CellError, CellRef, RangeRef, Value};
 use gridcraft_formula::Expr;
 use gridcraft_model::{CalcMode, Workbook};
 
-use crate::eval::{Area, Evaluator, Host, precedents_shifted};
+use crate::eval::{Area, Evaluator, Host, NameCache, precedents_shifted_with};
 
 pub type Key = (usize, CellRef);
 
@@ -372,6 +372,11 @@ impl Graph {
     }
 
     /// Formulas that read cell `c` of `sheet`.
+    /// Whether the formula at `k` is evaluated on every recalc (its references aren't known
+    /// statically: INDIRECT, OFFSET, tables, unresolvable names).
+    pub fn is_dynamic(&self, k: Key) -> bool {
+        self.dynamic.contains(&k)
+    }
     pub fn dependents(&self, sheet: usize, c: CellRef, out: &mut Vec<Key>) {
         if let Some(v) = self.cell_deps.get(&(sheet, c)) {
             v.for_each(|k| out.push(k));
@@ -641,6 +646,10 @@ struct PassHost<'a> {
     tainted: HashSet<Key>,
     /// Whether the formula being evaluated has read a previous value so far (when iterating).
     taint: bool,
+    /// Parsed defined names, by (lower-cased name, scope sheet asked from): the workbook doesn't
+    /// change during a pass, and a column of cells calling one LAMBDA name would otherwise parse
+    /// that name's formula (and every name it calls) once per cell.
+    names: HashMap<(String, usize), Option<(Option<std::sync::Arc<Expr>>, Option<usize>)>>,
 }
 
 /// How often a range has been read in a pass, and its shared array once it is shared.
@@ -742,6 +751,7 @@ impl<'a> PassHost<'a> {
             members: HashSet::default(),
             tainted: HashSet::default(),
             taint: false,
+            names: HashMap::default(),
         }
     }
 
@@ -1106,6 +1116,16 @@ impl Host for PassHost<'_> {
     fn workbook(&self) -> &Workbook {
         self.wb
     }
+    /// The parsed definition, cached for the pass: the workbook's names don't change while it runs.
+    fn name_expr(&mut self, name: &str, scope_sheet: usize) -> Option<(Option<std::sync::Arc<Expr>>, Option<usize>)> {
+        let key = (name.to_ascii_lowercase(), scope_sheet);
+        if let Some(hit) = self.names.get(&key) {
+            return hit.clone();
+        }
+        let found = self.wb.name(name, scope_sheet).map(|def| (gridcraft_formula::parse(&def.formula).ok().map(std::sync::Arc::new), def.scope));
+        self.names.insert(key, found.clone());
+        found
+    }
     fn spill_range(&mut self, sheet: usize, anchor: CellRef) -> Option<RangeRef> {
         let k = (sheet, anchor);
         let done = self.result(&k).is_some();
@@ -1367,13 +1387,14 @@ impl Calc {
             self.rebuild(new);
             return;
         }
+        let mut names = NameCache::default();
         for (si, c) in changed {
             if let Some(b) = new.sheets.get(si) {
                 let k = (si, c);
                 let cell = b.cell(c);
                 match cell.and_then(|x| x.formula.as_deref()).and_then(parsed) {
                     Some((e, shift)) => {
-                        let (areas, dynamic) = precedents_shifted(new, si, &e, shift);
+                        let (areas, dynamic) = precedents_shifted_with(new, si, &e, shift, &mut names);
                         self.graph.insert(k, Node::new(areas, dynamic));
                         if cell.is_some_and(|x| x.value == Value::Error(CellError::Spill)) {
                             self.spill_blocked.insert(k);
@@ -1407,13 +1428,13 @@ impl Calc {
         self.graph.cell_deps.reserve(formulas.len());
         // Working out precedents is independent per formula (spread over threads); the indexes
         // are filled on this thread.
-        let nodes = crate::par::filter_map(&formulas, |&(k, cell)| {
+        let nodes = crate::par::filter_map_init(&formulas, NameCache::default, |names, &(k, cell)| {
             let f = cell.formula.as_deref()?;
             let (areas, dynamic) = match f.parsed_ref() {
-                Some((e, (r, c))) => precedents_shifted(wb, k.0, e, (r.into(), c.into())),
+                Some((e, (r, c))) => precedents_shifted_with(wb, k.0, e, (r.into(), c.into()), names),
                 None => {
                     let (e, shift) = parsed(f)?;
-                    precedents_shifted(wb, k.0, &e, shift)
+                    precedents_shifted_with(wb, k.0, &e, shift, names)
                 }
             };
             Some((k, Node::new(areas, dynamic), cell.value == Value::Error(CellError::Spill)))
@@ -1484,11 +1505,12 @@ impl Calc {
     /// evaluated here and nothing is returned.
     pub fn prepare(&mut self, wb: &mut Workbook, changed: &[Key]) -> Vec<Key> {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
+        let mut names = NameCache::default();
         for &k in changed {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_deref()).and_then(parsed);
             match formula {
                 Some((e, shift)) => {
-                    let (areas, dynamic) = precedents_shifted(wb, k.0, &e, shift);
+                    let (areas, dynamic) = precedents_shifted_with(wb, k.0, &e, shift, &mut names);
                     self.graph.insert(k, Node::new(areas, dynamic));
                 }
                 None => {
