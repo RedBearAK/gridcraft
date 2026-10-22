@@ -2661,7 +2661,7 @@ fn calculation_options_enable_iterative_calculation() {
     assert!(!s.doc().unwrap().calc.circular.is_empty());
     // Switching it on recalculates the loop.
     let r = s.execute("formulas.calculationOptions", json!({"iterative": true})).unwrap();
-    assert_eq!(r, json!({"mode": "Automatic", "iterative": true, "maxIterations": 100, "maxChange": 0.001}));
+    assert_eq!(r, json!({"mode": "Automatic", "iterative": true, "maxIterations": 100, "maxChange": 0.001, "multiThreaded": true, "threads": 0}));
     near(&s, "A1", 10.0);
     near(&s, "A2", 10.0);
     assert!(s.doc().unwrap().calc.circular.is_empty());
@@ -4505,4 +4505,30 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
     s.execute("range.setValues", json!({"range": "A1", "values": [["a", "b"]]})).unwrap();
     let html = crate::io::to_html(&s.doc().unwrap().wb, 0).unwrap();
     assert!(!html.contains("<colgroup>") && !html.contains("table-layout") && !html.contains("<svg") && !html.contains("<img"), "{html}");
+}
+
+#[test]
+fn calculation_options_set_the_thread_count() {
+    let mut s = s();
+    let r = s.execute("formulas.calculationOptions", json!({"multiThreaded": false, "threads": 5000})).unwrap();
+    assert_eq!((r["multiThreaded"].as_bool(), r["threads"].as_u64()), (Some(false), Some(1024)));
+    assert!(!s.doc().unwrap().wb.calc.multi_threaded);
+    assert_eq!(s.doc().unwrap().wb.calc.threads, 1024);
+    let r = s.execute("formulas.calculationOptions", json!({"multiThreaded": true, "threads": 0})).unwrap();
+    assert_eq!((r["multiThreaded"].as_bool(), r["threads"].as_u64()), (Some(true), Some(0)));
+}
+
+#[test]
+fn a_workbooks_thread_settings_survive_the_file() {
+    let mut s = s();
+    s.execute("formulas.calculationOptions", json!({"multiThreaded": false, "threads": 3})).unwrap();
+    let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+    let (wb, _) = gridcraft_xlsx::read_xlsx(&bytes).unwrap();
+    assert!(!wb.calc.multi_threaded);
+    assert_eq!(wb.calc.threads, 3);
+    s.execute("formulas.calculationOptions", json!({"multiThreaded": true})).unwrap();
+    let (wb, _) = gridcraft_xlsx::read_xlsx(&gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap()).unwrap();
+    assert!(wb.calc.multi_threaded && wb.calc.threads == 3);
+    let r = s.execute("file.options", json!({})).unwrap();
+    assert_eq!((r["calculation"]["multiThreaded"].as_bool(), r["calculation"]["threads"].as_u64()), (Some(true), Some(3)));
 }
