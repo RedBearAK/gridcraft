@@ -177,6 +177,8 @@ pub struct ScrollRail {
     axis: RailAxis,
     /// When the swipe last moved.
     last: f64,
+    /// The scroll comes from a mouse wheel's notches, not a trackpad: it passes unchanged.
+    wheel: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -198,13 +200,18 @@ const RAIL_RATIO: f32 = 2.0;
 impl ScrollRail {
     /// The part of `d` (one frame's scroll) to apply: along the swipe's axis only, or all of it
     /// for a diagonal swipe. `reported` is the movement the device reported this frame, by axis;
-    /// it decides the axis, so the smoothed tail of an earlier swipe can't.
-    pub fn steer(&mut self, d: egui::Vec2, reported: egui::Vec2, now: f64) -> egui::Vec2 {
+    /// it decides the axis, so the smoothed tail of an earlier swipe can't. `wheel` when this
+    /// frame brought mouse-wheel notches (line or page units), which are left alone.
+    pub fn steer(&mut self, d: egui::Vec2, reported: egui::Vec2, wheel: bool, now: f64) -> egui::Vec2 {
         let since = now - self.last;
         if since.is_nan() || since > RAIL_GAP {
             *self = ScrollRail::default();
         }
         self.last = now;
+        self.wheel |= wheel;
+        if self.wheel {
+            return d;
+        }
         if self.axis == RailAxis::Undecided {
             self.travel += reported.abs();
             let t = self.travel;
@@ -222,12 +229,13 @@ impl ScrollRail {
             RailAxis::Vertical => vec2(0.0, d.y),
             RailAxis::Horizontal => vec2(d.x, 0.0),
             RailAxis::Free => d,
-            // Until it's decided, the swipe moves along the way it has mostly gone so far. Before
-            // it has moved at all, what's left of an earlier swipe's glide stops, as fingers
-            // touching the trackpad stop it.
+            // Until it's decided, the swipe moves along an axis it already clearly follows, and
+            // both ways otherwise. Before it has moved at all, what's left of an earlier swipe's
+            // glide stops, as fingers touching the trackpad stop it.
             RailAxis::Undecided if self.travel == egui::Vec2::ZERO => egui::Vec2::ZERO,
-            RailAxis::Undecided if self.travel.y >= self.travel.x => vec2(0.0, d.y),
-            RailAxis::Undecided => vec2(d.x, 0.0),
+            RailAxis::Undecided if self.travel.y >= RAIL_RATIO * self.travel.x => vec2(0.0, d.y),
+            RailAxis::Undecided if self.travel.x >= RAIL_RATIO * self.travel.y => vec2(d.x, 0.0),
+            RailAxis::Undecided => d,
         }
     }
 }
@@ -706,7 +714,20 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                     })
                     .fold(egui::Vec2::ZERO, |a, b| a + b)
             });
-            let mut d = app.grid.scroll_rail.steer(scroll_delta, reported, now);
+            let wheel = ui.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page, .. }))
+            });
+            // Shift (horizontal) or Alt (vertical) already puts the scroll on one axis; egui
+            // moves it there after the event, so the reported axis would be the wrong one.
+            let forced = ui.ctx().options(|o| {
+                modifiers.matches_any(o.input_options.horizontal_scroll_modifier) || modifiers.matches_any(o.input_options.vertical_scroll_modifier)
+            });
+            let mut d = if forced {
+                app.grid.scroll_rail = ScrollRail::default();
+                scroll_delta
+            } else {
+                app.grid.scroll_rail.steer(scroll_delta, reported, wheel, now)
+            };
             // A horizontal swipe moves the content the way the fingers go, which is towards
             // higher columns on a mirrored sheet.
             if sh.right_to_left {
