@@ -184,6 +184,16 @@ fn cmd_ci() -> Result<(), String> {
                 run(c, "cargo test --workspace")
             }),
         ),
+        (
+            "test-threaded",
+            Box::new(|| {
+                // The calc and engine suites (the command-sequence fuzz included) with every
+                // level of a recalculation on worker threads, however small.
+                let mut c = cargo();
+                c.args(["test", "-p", "gridcraft-calc", "-p", "gridcraft-engine"]).env("GRIDCRAFT_PARALLEL_MIN", "1");
+                run(c, "GRIDCRAFT_PARALLEL_MIN=1 cargo test -p gridcraft-calc -p gridcraft-engine")
+            }),
+        ),
         ("assets", Box::new(|| assets::run(&root()))),
         ("layers", Box::new(cmd_layers)),
         ("wasm", Box::new(cmd_wasm)),

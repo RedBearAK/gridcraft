@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-21 · **Change:** minor (Page Setup paper sizes: JIS B4/B5/B6, the Japanese postcards and envelopes, and A6; long flat operator chains up to Excel's formula limit) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-22 · **Change:** minor (recalculation runs levels of independent formulas on every core) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -125,7 +125,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
    correctness, chart kind round-trip, CJK font fallback, macOS Finder open, German and Chinese
    UI). Review and merge: 8–15 h.
 2. **XLSX fidelity on a real-world corpus**, with Excel opening our output without repair: 25–35 h.
-3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M rows, multi-threaded recalc: 40–60 h.
+3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M rows (multi-threaded recalc landed 2026-10-22): 30–50 h.
 4. **Charts depth**: kinds and options round-trip, axes, trendlines, error bars: 25–35 h.
 5. **Text in every script** (CJK, Thai, Arabic, Devanagari) in cells and PDF: 12–20 h.
 6. **Legacy `.xls` import and password-protected workbooks**: 20–30 h.
@@ -135,6 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-22 | Recalculation runs on every core: the dirty formulas are planned into levels of formulas that don't read one another, and wide levels are calculated on worker threads, each reading the main pass's results so far and handing back any formula that turns out to read one not done yet (INDIRECT, OFFSET, a spill of this pass), which the main thread finishes with the usual bounded-stack machinery. RAND stays on the main thread in row-major order; iterative calculation and wasm stay single-threaded. Each worker keeps a copy of the blocks it reads twice in a level (text included, within a byte budget the workers share), which is where much of the gain on lookups comes from; the single-threaded pass has no such copies yet. A 1M-cell workbook with 51K LAMBDA-name calls opens in 4.0 s on 8 threads (13.7 s on one); 41K lookups over columns of formulas in 2.1 s (4.2 s). On one thread, too, the pass now follows the plan, so the order RAND draws in is the same on every machine (RAND sequences differ from earlier releases); formulas on or behind a cycle still run in row-major order after the levels, so `#CIRC!` moves only where a leveled INDIRECT or OFFSET reader reaches the cycle first. Planning costs about 20 ms per 100K dirty formulas, up to 0.6 s and 430 MB for a million formulas with 64 precedents each. `calcPr concurrentCalc`/`concurrentManualCount` round-trip; `formulas.calculationOptions` sets `multiThreaded`/`threads` |
 | 2026-10-21 | Page Setup paper sizes match Japanese Excel: `B4`/`B5`/`B6` are the JIS sizes (ISO B4/B5/B6 stay reachable by name), so a Japanese B5 worksheet prints at 182×257 mm; Japanese Postcard (100×148 mm), Double Postcard (148×200 mm), Envelope #3/#4 (120×235/90×205 mm), Kaku #2/#3 (240×332/216×277 mm) and A6 are added, both sizes reach the PDF page (`file.exportPdf`/`file.print` MediaBox) and the size survives an XLSX round-trip; the Page Layout Size menu lists them. `B4`/`B5` used to be the ISO sizes, which is changed here |
 | 2026-10-21 | Trackpad scrolling holds a swipe to the axis it starts along: scrolling down a column no longer drifts sideways (or along a row, up and down), the glide after lifting included; a clearly diagonal swipe still moves freely |
 | 2026-10-20 | Japanese interface catalog covers every key the Brazilian Portuguese catalog translates: the 398-label shared core plus 545 dialog, message, Backstage and menu strings (943 total, ~43% of ~2,200). A test parses `pt.rs`'s source, so the two catalogs stay in step |
@@ -222,6 +223,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | Progress log: multi-threaded recalculation |
 | 2026-10-21 | minor | Page Setup paper sizes: JIS B4/B5/B6 (ISO by name), Japanese postcards and envelopes, A6; PDF page size follows, XLSX round-trips |
 | 2026-10-20 | minor | Dutch (nl) listed under other shipped languages; progress log row |
 | 2026-10-19 | minor | Progress log: long flat operator chains (#916) |

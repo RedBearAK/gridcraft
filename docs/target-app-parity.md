@@ -1,6 +1,6 @@
 # Target-app parity: GridCraft vs Microsoft Excel
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-21 · **Change:** minor (Page Setup paper sizes match Japanese Excel: B4/B5/B6 are the JIS sizes, with ISO B4/B5/B6 by name and the Japanese postcards, envelopes and A6 added; no score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-22 · **Change:** minor (recalculation runs levels of independent formulas on every core; two 1M-cell workbooks timed on one and eight threads) · **Target:** Microsoft Excel (Microsoft 365)
 
 This is the authoritative parity assessment. [`ROADMAP.md`](../ROADMAP.md) summarizes it,
 [`gaps.md`](gaps.md) lists every shortfall, and the area checklists hold the detail:
@@ -203,17 +203,19 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Measure | GridCraft | Excel | Kind |
 |---|---|---|---|
 | Sheet size limits | 1,048,576 × 16,384 | same | measured (`crates/core/src/addr.rs`) |
-| Recalc threads | 1 | all cores | measured (no threading in `crates/calc`) |
+| Recalc threads | every core for levels of independent formulas (2026-10-22); wasm and iterative calculation single-threaded | all cores | measured on an 8-core laptop: 51K LAMBDA-name calls, evaluation 11.9 s on one thread → 2.2 s on eight; 41K lookups over columns of formulas 2.5 s → 0.3 s, most of it from the copies each worker keeps of the blocks it reads twice (the threads alone gave about 1.6 s), which the single-threaded pass doesn't have yet |
 | Edit → recalc, 100k dependents | ~0.4 s (2026-10-07), target < 100 ms | tens of ms | measured on the owner's machine; #66 since made range-formula recalc linear, not re-timed |
 | Formulas referencing defined names | static dependencies (2026-10-14; were volatile: every name made its formula recalculate on every edit) | static | measured: 1M-cell workbook with 49K LAMBDA-name calls, unrelated edit ~10 s → ~1 s |
-| Open a 1M-cell, 49K-formula XLSX (no cached values) | 109 s single-threaded (2026-10-14; was 447 s) | seconds, multi-threaded | measured on a 2-core sandbox |
+| Open a 1M-cell, 49K-formula XLSX (no cached values) | 109 s single-threaded on a 2-core sandbox (2026-10-14; was 447 s); 13.7 s on one thread, 4.0 s on eight on an 8-core laptop (2026-10-22) | seconds, multi-threaded | measured |
 | Grid scrolling | virtualised, O(log n) geometry with custom row heights | smooth | measured in code |
 | Open a ~100 MB XLSX | fails (#175) | opens | user report |
 | Whole-sheet operations | Fill and Remove Duplicates on a whole-sheet selection run out of memory or time (fix in PR #152) | fine | open PR |
 
-Work: streaming XLSX reader with shared-string and style dedup, multi-threaded recalc of
-independent chains (native only; WASM stays single-threaded), whole-column reference
+Work: streaming XLSX reader with shared-string and style dedup, whole-column reference
 clamping, a `cargo xtask bench` with fixed workbooks so the numbers become measured.
+Multi-threaded recalc landed 2026-10-22 (levels of independent formulas on worker threads,
+per-worker copies of the blocks read twice; wasm stays single-threaded; the single-threaded
+pass follows the same plan, so results don't depend on the machine).
 
 ## Platforms
 
@@ -336,6 +338,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-22 | minor | Performance: recalculation runs levels of independent formulas on every core; open times of two 1M-cell workbooks measured on one and eight threads |
 | 2026-10-21 | minor | Page Setup paper sizes: `B4`/`B5`/`B6` are the JIS sizes Japanese Excel uses (ISO B4/B5/B6 by name), and Japanese Postcard, Japanese Double Postcard, the chou/kaku envelopes and A6 are added; PDF MediaBox and `file.print` follow, and the Size menu lists them |
 | 2026-10-18 | trivial | Stale chart notes: all chart kinds survive XLSX round-trip (PRs #158, #161) and trendlines landed |
 | 2026-10-16 | minor | Advanced Filter copy-to clears only its actual output and rejects overflow without changing cells (#1031) |
