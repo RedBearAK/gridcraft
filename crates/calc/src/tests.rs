@@ -2370,6 +2370,8 @@ fn names_mentioned_many_times_are_resolved_once() {
     assert!(deps.contains(&(0, c("B1"))));
 }
 
+// ---- Multi-threaded recalculation ----------------------------------------------------------
+
 impl T {
     /// Enters every cell, then recalculates the workbook at once: one pass over all of them.
     fn load(&mut self, cells: impl IntoIterator<Item = (String, String)>) {
@@ -2392,6 +2394,14 @@ impl T {
             hidden: false,
         });
     }
+    /// Calculation threads: 1 is upstream's single-threaded pass, the oracle the others match.
+    fn threads(mut self, n: u32) -> T {
+        self.wb.calc.multi_threaded = n > 1;
+        self.wb.calc.threads = n;
+        // Whatever `GRIDCRAFT_CALC_THREADS` says and however many processors there are.
+        self.calc.threads = Some(n as usize);
+        self
+    }
 }
 
 /// Every stored value, spill and circular reference of `a` and `b` is the same.
@@ -2410,6 +2420,97 @@ fn same_values(a: &T, b: &T, what: &str) {
     ca.sort();
     cb.sort();
     assert_eq!(ca, cb, "{what}: circular references");
+}
+
+/// A workbook with a bit of everything, in levels wide enough to be threaded: lookups over a
+/// range of formulas, INDIRECT readers of their own row (no static edge, so the workers hand
+/// them back), a defined name, a running-sum chain (one formula per level), whole-range sums,
+/// a spill with readers of its range, a cycle and formulas behind it, and a second sheet whose
+/// formulas read the first's and are read back by it.
+fn mixed_workbook(threads: u32) -> T {
+    let n = 3_000;
+    let mut t = T::new().threads(threads);
+    t.name("Base", "Sheet1!$B$7");
+    t.wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Data")));
+    for r in 1..=600u32 {
+        let data = t.wb.sheet_mut(1).unwrap();
+        data.cells.set(c(&format!("A{r}")), Cell::formula(Formula::new(&format!("=SUM(Sheet1!$B$1:$B${n})+ROW()"))));
+        data.cells.set(c(&format!("B{r}")), Cell::formula(Formula::new(&format!("=VLOOKUP(Sheet1!A{r},Sheet1!$A$1:$C${n},3,FALSE)"))));
+    }
+    let mut cells: Vec<(String, String)> = Vec::new();
+    for r in 1..=n {
+        cells.push((format!("A{r}"), format!("={}", (r * 37) % 1000)));
+        cells.push((format!("B{r}"), format!("=A{r}*2+ROW()")));
+        cells.push((format!("C{r}"), format!("=VLOOKUP({},$A$1:$B${n},2,FALSE)", (r * 37) % 1000)));
+        cells.push((format!("D{r}"), "=INDIRECT(\"B\"&ROW())+Base".to_string()));
+        cells.push((format!("E{r}"), format!("=IF(MOD(A{r},2)=0,\"even\"&A{r},LEN(\"odd\"&B{r}))")));
+        cells.push((format!("F{r}"), if r == 1 { "=B1".to_string() } else { format!("=F{}+B{r}", r - 1) }));
+        cells.push((format!("G{r}"), format!("=SUM($B$1:$B${n})/ROW()")));
+        if r <= 600 {
+            cells.push((format!("M{r}"), format!("=SUM(J1#)+A{r}")));
+            cells.push((format!("N{r}"), "=L1+ROW()".to_string()));
+            cells.push((format!("H{r}"), format!("=Data!A{r}+Data!B{r}")));
+        }
+    }
+    cells.push(("J1".to_string(), "=SEQUENCE(50,1,A3)".to_string()));
+    cells.push(("K1".to_string(), "=SUM(J1#)+COUNT(J2:J50)".to_string()));
+    cells.push(("L1".to_string(), "=L2+1".to_string()));
+    cells.push(("L2".to_string(), "=L1+1".to_string()));
+    t.load(cells);
+    t
+}
+
+#[test]
+fn multi_threaded_recalc_matches_one_thread() {
+    let mut one = mixed_workbook(1);
+    let mut many = mixed_workbook(8);
+    same_values(&one, &many, "after load");
+    assert!(
+        many.calc.worker_levels > 0 && one.calc.worker_levels == 0,
+        "levels on workers: {} and {}",
+        many.calc.worker_levels,
+        one.calc.worker_levels
+    );
+    let data = many.wb.sheet(1).unwrap();
+    assert_eq!(data.value(c("B600")), many.get("C600"));
+    assert_eq!(many.num("H600"), data.value(c("A600")).as_f64().unwrap() + data.value(c("B600")).as_f64().unwrap());
+    // Spot checks against values worked out by hand.
+    assert_eq!(one.num("D10"), one.num("B10") + one.num("B7"));
+    assert_eq!(one.num("C5"), one.num("B5"));
+    let spill_sum = (0..50).map(|i| f64::from(i) + one.num("A3")).sum::<f64>();
+    assert_eq!(one.num("K1"), spill_sum + 49.0);
+    assert_eq!(many.num("M600"), spill_sum + many.num("A600"));
+    assert_eq!(many.num("F3000"), (1..=3000).map(|r| many.num(&format!("B{r}"))).sum::<f64>());
+    assert_eq!(many.get("L1"), Value::Error(CellError::Circ));
+    assert_eq!(many.get("N600"), Value::Error(CellError::Circ));
+    // Edits recalculate thousands of formulas in wide levels again: a lookup table entry, the
+    // name's target, the spill's start.
+    for (at, input) in [("A1", "=999"), ("B7", "=-1"), ("A3", "=100")] {
+        one.set(at, input);
+        many.set(at, input);
+        same_values(&one, &many, &format!("after {at} = {input}"));
+        assert!(many.calc.worker_levels > 0, "after {at} = {input}: no level on workers");
+    }
+    assert_eq!(many.num("K1"), (0..50).map(|i| f64::from(i) + 100.0).sum::<f64>() + 49.0);
+}
+
+#[test]
+fn thread_count_follows_the_settings() {
+    if std::env::var_os("GRIDCRAFT_CALC_THREADS").is_some() {
+        eprintln!("skipped: GRIDCRAFT_CALC_THREADS overrides the settings");
+        return;
+    }
+    // Never more than the processors present (a workbook's count travels with the file).
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
+    let mut s = gridcraft_model::CalcSettings { threads: 3, ..Default::default() };
+    assert_eq!(crate::recalc::thread_count(&s), if cfg!(target_arch = "wasm32") { 1 } else { 3.min(cores) });
+    s.multi_threaded = false;
+    assert_eq!(crate::recalc::thread_count(&s), 1);
+    s.multi_threaded = true;
+    s.threads = 0;
+    assert_eq!(crate::recalc::thread_count(&s), if cfg!(target_arch = "wasm32") { 1 } else { cores });
+    s.threads = 1000;
+    assert!(crate::recalc::thread_count(&s) <= cores);
 }
 
 #[test]
@@ -2431,10 +2532,11 @@ fn levels_put_readers_after_what_they_read() {
 #[test]
 fn readers_of_a_spill_area_are_planned_after_its_anchor() {
     // B1..B600 read the cells A1 spills over, and Z1, as A1 does. With the spill range known,
-    // they are planned after A1 and read its new array in the first round; the write-back then
-    // queues them once more (the readers of a changed spill range), as before.
-    let book = || {
-        let mut t = T::new();
+    // they are planned after A1 and read its new array in the first round, as one thread does
+    // in row-major order; the write-back then queues them once more either way (the readers of
+    // a changed spill range), so the counts match too.
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
         t.set("Z1", "1");
         t.load((1..=600).map(|r| (format!("B{r}"), format!("=A{r}+Z1"))).chain([("A1".to_string(), "=SEQUENCE(600,1,Z1)".to_string())]));
         assert_eq!((t.num("B1"), t.num("B600")), (2.0, 601.0));
@@ -2442,7 +2544,10 @@ fn readers_of_a_spill_area_are_planned_after_its_anchor() {
         assert_eq!((t.num("B1"), t.num("B600")), (10.0, 609.0));
         t
     };
-    assert_eq!(book().calc.last_recalc_cells, 601 + 600);
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "spill readers");
+    assert_eq!(one.calc.last_recalc_cells, 601 + 600);
+    assert_eq!(many.calc.last_recalc_cells, one.calc.last_recalc_cells);
 }
 
 #[test]
@@ -2453,27 +2558,90 @@ fn a_chain_of_spill_areas_resolves_in_three_rounds() {
     // formulas run in row-major order: on one thread the 8-round limit leaves the chain stale
     // (A1 = 4193, three links short). Planned in levels, the spill ranges laid out by the first
     // round order the second one, which settles every link; the third finds nothing changed.
-    let mut t = T::new();
-    let mut cells = vec![("K1".to_string(), "=SEQUENCE(600,1,Z1)".to_string()), ("Z1".to_string(), "1".to_string())];
-    for (i, col) in "JIHGFEDCBA".chars().enumerate() {
-        let prev = "KJIHGFEDCB".chars().nth(i).unwrap_or('K');
-        cells.push((format!("{col}1"), format!("=SEQUENCE(600,1,MAX({prev}2:{prev}600))")));
+    for threads in [1, 8] {
+        let mut t = T::new().threads(threads);
+        let mut cells = vec![("K1".to_string(), "=SEQUENCE(600,1,Z1)".to_string()), ("Z1".to_string(), "1".to_string())];
+        for (i, col) in "JIHGFEDCBA".chars().enumerate() {
+            let prev = "KJIHGFEDCB".chars().nth(i).unwrap_or('K');
+            cells.push((format!("{col}1"), format!("=SEQUENCE(600,1,MAX({prev}2:{prev}600))")));
+        }
+        t.load(cells);
+        assert_eq!(t.num("A1"), 1.0 + 10.0 * 599.0, "{threads} threads");
+        assert_eq!(t.num("A600"), 600.0 + 10.0 * 599.0, "{threads} threads");
+        assert_eq!(t.calc.last_recalc_cells, 11 + 10 + 9, "{threads} threads");
     }
-    t.load(cells);
-    assert_eq!(t.num("A1"), 1.0 + 10.0 * 599.0);
-    assert_eq!(t.num("A600"), 600.0 + 10.0 * 599.0);
-    assert_eq!(t.calc.last_recalc_cells, 11 + 10 + 9);
+}
+
+#[test]
+fn formulas_handed_back_by_workers_are_right_and_counted_once() {
+    // Each C reads its row's B through INDIRECT: no static edge, so C shares B's level and every
+    // worker hands it back for the main thread, which calculates it once B is merged.
+    let mut t = T::new().threads(8);
+    t.load((1..=600).flat_map(|r| [(format!("B{r}"), "=ROW()*3".to_string()), (format!("C{r}"), "=INDIRECT(\"B\"&ROW())+1".to_string())]));
+    for r in [1u32, 300, 600] {
+        assert_eq!(t.num(&format!("C{r}")), f64::from(r * 3 + 1));
+    }
+    assert_eq!(t.calc.last_recalc_cells, 1200);
+    assert!(t.calc.circular.is_empty());
+    assert!(t.calc.worker_levels > 0);
+}
+
+#[test]
+fn random_draws_come_from_one_generator_in_order_on_any_thread_count() {
+    // RAND directly (kept on the main thread by its formula) and through a LAMBDA name (handed
+    // back when the draw happens): the same sequence as one thread, no duplicates.
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.name("Roll", "LAMBDA(RAND())");
+        t.load((1..=600).map(|r| (format!("A{r}"), "=Roll()".to_string())).chain((1..=600).map(|r| (format!("B{r}"), "=RAND()".to_string()))));
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "RAND");
+    let mut seen = std::collections::HashSet::new();
+    for r in 1..=600 {
+        for col in ["A", "B"] {
+            let v = many.num(&format!("{col}{r}"));
+            assert!((0.0..1.0).contains(&v), "{col}{r} = {v}");
+            assert!(seen.insert(v.to_bits()), "{col}{r} repeats {v}");
+        }
+    }
 }
 
 #[test]
 fn a_long_chain_is_one_formula_per_level() {
     let n = 20_000;
-    let mut t = T::new();
-    t.load((1..n).map(|r| (format!("C{r}"), format!("=C{}+1", r + 1))).chain([(format!("C{n}"), "=1".to_string())]));
-    assert_eq!(t.num("C1"), f64::from(n));
-    assert!(t.calc.circular.is_empty());
-    t.set(&format!("C{n}"), "=10");
-    assert_eq!(t.num("C1"), f64::from(n + 9));
+    for threads in [1, 8] {
+        let mut t = T::new().threads(threads);
+        t.load((1..n).map(|r| (format!("C{r}"), format!("=C{}+1", r + 1))).chain([(format!("C{n}"), "=1".to_string())]));
+        assert_eq!(t.num("C1"), f64::from(n), "{threads} threads");
+        assert!(t.calc.circular.is_empty());
+        t.set(&format!("C{n}"), "=10");
+        assert_eq!(t.num("C1"), f64::from(n + 9), "{threads} threads");
+    }
+}
+
+#[test]
+fn iterative_calculation_ignores_the_thread_count() {
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.wb.calc.iterative = true;
+        t.wb.calc.max_iterations = 50;
+        // The cycles alone would never make a level; the plain formulas in C are a wide level
+        // that eight threads would calculate on workers if iterative calculation didn't force one.
+        t.load(
+            (1..=600)
+                .map(|r| (format!("A{r}"), format!("=B{r}+1")))
+                .chain((1..=600).map(|r| (format!("B{r}"), format!("=A{r}*0.5"))))
+                .chain((1..=600).map(|r| (format!("C{r}"), "=ROW()*2".to_string()))),
+        );
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "iterative");
+    assert!((one.num("A600") - 2.0).abs() < 0.01);
+    assert_eq!(many.num("C600"), 1200.0);
+    assert_eq!((one.calc.worker_levels, many.calc.worker_levels), (0, 0), "iterative calculation runs on one thread");
 }
 
 fn xorshift(s: &mut u64) -> u64 {
@@ -2555,11 +2723,11 @@ fn random_acyclic_sheet(seed: u64, rows: u32, cols: u32) -> (Vec<(String, String
 fn a_plan_given_up_for_its_cost_gives_the_same_values_in_row_major_order() {
     // The budget is generous (a million units plus hundreds per formula); a test caps it at
     // nothing, so planning is given up at the first formula and the pass runs row-major with
-    // the usual on-demand evaluation.
+    // the usual on-demand evaluation, on any thread count.
     for seed in [3u64, 11] {
         let (cells, names) = random_acyclic_sheet(seed * 104_729, 300, 8);
-        let book = |cap: Option<usize>| {
-            let mut t = T::new();
+        let book = |cap: Option<usize>, threads: u32| {
+            let mut t = T::new().threads(threads);
             t.calc.plan_budget = cap;
             for (name, formula) in &names {
                 t.name(name, formula);
@@ -2567,13 +2735,240 @@ fn a_plan_given_up_for_its_cost_gives_the_same_values_in_row_major_order() {
             t.load(cells.iter().cloned());
             t
         };
-        let planned = book(None);
+        let planned = book(None, 1);
         let keys: Vec<Key> = planned.wb.sheet(0).unwrap().cells.iter().filter(|(_, cell)| cell.formula.is_some()).map(|(at, _)| (0, at)).collect();
         assert!(planned.calc.graph.levels(&planned.wb, &keys).is_some());
         assert!(planned.calc.graph.levels_within(&planned.wb, &keys, Some(0)).is_none());
-        let fallback = book(Some(0));
-        same_values(&planned, &fallback, &format!("seed {seed}, no plan"));
+        for threads in [1, 8] {
+            let fallback = book(Some(0), threads);
+            same_values(&planned, &fallback, &format!("seed {seed}, no plan, {threads} threads"));
+            assert_eq!(fallback.calc.worker_levels, 0, "seed {seed}: nothing is threaded without a plan");
+        }
     }
+}
+
+#[test]
+fn the_generated_defined_names_are_names_not_references() {
+    // A name such as `N5` or `R7` is read as the cell in column N or R, so the generated sheets
+    // would read empty cells and test no name precedents at all; Excel refuses a name in A1 or
+    // R1C1 form (`R`, `C`, `RC`, `R2C3`) outright.
+    let r1c1 = |n: &str| {
+        let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+        let mut rest = n;
+        if let Some(r) = rest.strip_prefix(['R', 'r']) {
+            rest = r.get(digits(r)..).unwrap_or("");
+        }
+        if let Some(c) = rest.strip_prefix(['C', 'c']) {
+            rest = c.get(digits(c)..).unwrap_or("");
+        }
+        rest.is_empty()
+    };
+    for seed in 1..=8 {
+        let (_, names) = random_acyclic_sheet(seed, 12, 8);
+        assert!(!names.is_empty(), "seed {seed} defines names");
+        for (name, _) in names {
+            let reference = gridcraft_core::CellRef::parse(&name).is_some() || gridcraft_core::RangeRef::parse(&name).is_some() || r1c1(&name);
+            assert!(!reference, "`{name}` would be read as a reference, not a name");
+        }
+    }
+}
+
+#[test]
+fn full_recalc_matches_entering_cells_one_by_one_at_any_thread_count() {
+    // `GRIDCRAFT_ORDER_FUZZ_SEEDS=50` soaks it.
+    let seeds: u64 = std::env::var("GRIDCRAFT_ORDER_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    for seed in 1..=seeds {
+        let (cells, names) = random_acyclic_sheet(seed * 7919, 400, 8);
+        let book = |threads: u32| {
+            let mut t = T::new().threads(threads);
+            for (name, formula) in &names {
+                t.name(name, formula);
+            }
+            t
+        };
+        // Reference: entered in order, each formula reading only finished cells.
+        let mut want = book(1);
+        for (at, input) in &cells {
+            want.set(at, input);
+        }
+        for threads in [1, 8] {
+            let mut t = book(threads);
+            t.load(cells.iter().cloned());
+            let wrong: Vec<_> =
+                cells.iter().filter(|(at, _)| t.get(at) != want.get(at)).map(|(at, f)| (at, f, t.get(at), want.get(at))).take(5).collect();
+            assert!(wrong.is_empty(), "seed {seed}, {threads} threads: {wrong:?}");
+            assert!(t.calc.circular.is_empty(), "seed {seed}, {threads} threads: circular");
+            // With every level threaded (`GRIDCRAFT_PARALLEL_MIN=1`), the levels really ran there.
+            assert!(threads == 1 || t.calc.parallel_min > 1 || t.calc.worker_levels > 0, "seed {seed}: no level on workers");
+        }
+    }
+}
+
+#[test]
+fn manual_mode_evaluates_only_the_edited_formulas_on_any_thread_count() {
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.load((1..=600).flat_map(|r| [(format!("A{r}"), format!("={r}")), (format!("B{r}"), format!("=A{r}*2"))]));
+        t.wb.calc.mode = gridcraft_model::CalcMode::Manual;
+        // Entering 600 formulas at once in manual mode evaluates those and nothing else.
+        for r in 1..=600 {
+            t.wb.sheet_mut(0).unwrap().cells.set(c(&format!("A{r}")), Cell::formula(Formula::new(&format!("={}", r + 1000))));
+        }
+        let keys: Vec<Key> = (1..=600).map(|r| (0, c(&format!("A{r}")))).collect();
+        t.calc.cells_changed(&mut t.wb, &keys);
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "manual");
+    assert_eq!((many.num("A600"), many.num("B600")), (1600.0, 1200.0));
+    assert_eq!(many.calc.last_recalc_cells, 600);
+}
+
+/// A workbook with cycles reached in several ways: the error each cell shows, and the circular
+/// list, must not depend on the thread count (every pass is planned the same way).
+#[test]
+fn cycles_land_on_the_same_cells_on_any_thread_count() {
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        let mut cells: Vec<(String, String)> = Vec::new();
+        for r in 1..=600 {
+            cells.push((format!("A{r}"), format!("=B{r}+1")));
+            cells.push((format!("B{r}"), "=INDIRECT(\"A\"&ROW())*2".to_string()));
+            cells.push((format!("C{r}"), format!("=A{r}+SUM(D:D)")));
+            cells.push((format!("D{r}"), format!("=C{r}+ROW()")));
+            cells.push((format!("E{r}"), "=ROW()*3".to_string()));
+        }
+        t.load(cells);
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "cycles");
+    assert_eq!(many.get("A5"), Value::Error(CellError::Circ));
+    assert_eq!(many.get("D5"), Value::Error(CellError::Circ));
+    assert_eq!(many.num("E600"), 1800.0);
+    assert!(!many.calc.circular.is_empty());
+}
+
+#[test]
+fn a_spill_made_on_one_worker_is_read_by_formulas_on_the_same_level() {
+    // Entered together, the anchor has no spill range yet, so its readers share its level;
+    // they read the old (empty) area, the write-back queues them, and the second round is
+    // right, as on one thread (the write-back queues the readers of a changed spill range).
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.set("Z1", "10");
+        t.load((1..=600).map(|r| (format!("C{r}"), "=SUM(A2:A5)+ROW()".to_string())).chain([("A1".to_string(), "=SEQUENCE(5,1,Z1)".to_string())]));
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "spill read on the same level");
+    assert_eq!(many.num("C600"), 11.0 + 12.0 + 13.0 + 14.0 + 600.0);
+    assert_eq!(many.calc.last_recalc_cells, one.calc.last_recalc_cells);
+}
+
+#[test]
+fn two_anchors_colliding_in_a_wide_level_resolve_as_on_one_thread() {
+    // Workers take the level in row-major chunks of 32: A1 is the first formula and A50 the
+    // fiftieth, so the two anchors are calculated on different workers.
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.calc.parallel_min = 1;
+        t.load(
+            (1..=600)
+                .map(|r| (format!("F{r}"), "=ROW()".to_string()))
+                .chain([("A1".to_string(), "=SEQUENCE(100)".to_string()), ("A50".to_string(), "=SEQUENCE(100)".to_string())]),
+        );
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "colliding anchors");
+    assert!(many.calc.worker_levels > 0);
+    // A1's area holds A50's formula, so A1 can't spill; A50's area is free.
+    assert_eq!(many.get("A1"), Value::Error(CellError::Spill));
+    assert_eq!((many.num("A50"), many.num("A149")), (1.0, 100.0));
+}
+
+#[test]
+fn a_spill_range_read_on_a_worker_before_its_anchor_is_done_is_handed_back() {
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.load((1..=600).map(|r| (format!("C{r}"), "=ROWS(A1#)+COLUMNS(A1#)".to_string())).chain([("A1".to_string(), "=SEQUENCE(7)".to_string())]));
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "spill range on the same level");
+    assert_eq!(many.num("C600"), 8.0);
+    assert_eq!(many.calc.last_recalc_cells, one.calc.last_recalc_cells);
+}
+
+#[test]
+fn a_spill_landing_in_a_block_a_worker_has_read_ends_as_on_one_thread() {
+    // One worker (two threads, three formulas, one chunk) calculates A1, A2, A3 in order: A1
+    // reads the 100-cell block B2:CW2 (empty), A2 spills over it, A3 reads the block again.
+    // Whatever A3 saw, the write-back queues both readers again, so the final values and the
+    // cell count match one thread. That a worker's copied block is dropped by its own spill is
+    // checked directly by `recalc::tests::a_workers_copied_block_is_dropped_by_its_own_spill`.
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.calc.parallel_min = 1;
+        t.load([("A1", "=SUM(B2:CW2)"), ("A2", "=SEQUENCE(1,200)"), ("A3", "=SUM(B2:CW2)")].map(|(a, f)| (a.to_string(), f.to_string())));
+        t
+    };
+    let (one, two) = (book(1), book(2));
+    same_values(&one, &two, "copied block under a spill");
+    let want: f64 = (2..=101).map(f64::from).sum();
+    assert_eq!((two.num("A1"), two.num("A3")), (want, want));
+    assert_eq!(two.calc.last_recalc_cells, one.calc.last_recalc_cells);
+}
+
+#[test]
+fn a_wide_level_of_random_formulas_needs_no_fallback() {
+    let mut t = T::new().threads(8);
+    t.calc.parallel_min = 1;
+    t.load((1..=600).map(|r| (format!("A{r}"), "=RAND()".to_string())));
+    assert_eq!(t.calc.worker_fallbacks, 0);
+    let mut seen = std::collections::HashSet::new();
+    for r in 1..=600 {
+        let v = t.num(&format!("A{r}"));
+        assert!((0.0..1.0).contains(&v) && seen.insert(v.to_bits()), "A{r} = {v}");
+    }
+}
+
+#[test]
+fn a_failing_worker_falls_back_to_the_main_thread() {
+    let book = |fail| {
+        let mut t = T::new().threads(8);
+        t.calc.parallel_min = 1;
+        t.calc.fail_workers = fail;
+        t.load((1..=600).flat_map(|r| [(format!("A{r}"), format!("={r}")), (format!("B{r}"), format!("=A{r}*2+SUM(A1:A3)"))]));
+        t
+    };
+    let (ok, failed) = (book(false), book(true));
+    same_values(&ok, &failed, "worker failure");
+    assert_eq!(failed.num("B600"), 1206.0);
+    assert_eq!(ok.calc.worker_fallbacks, 0);
+    assert_eq!(failed.calc.worker_fallbacks, 2, "one fallback per threaded level");
+}
+
+#[test]
+fn legacy_array_formulas_fill_their_range_on_workers() {
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.calc.parallel_min = 1;
+        t.set("A1", "1");
+        t.set("A2", "2");
+        for r in 0..40u32 {
+            let col = format!("{}{}", char::from(b'C' + (r % 20) as u8), (r / 20) * 4 + 1);
+            let mut f = Formula::new("=A1:A2*2");
+            f.array = gridcraft_core::RangeRef::parse(&format!("{col}:{}{}", char::from(b'C' + (r % 20) as u8), (r / 20) * 4 + 3));
+            t.wb.sheet_mut(0).unwrap().cells.set(c(&col), Cell::formula(f));
+        }
+        t.calc.recalc_all(&mut t.wb);
+        t
+    };
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "legacy arrays");
+    assert_eq!((many.num("C2"), many.get("C3")), (4.0, Value::Error(CellError::NA)));
 }
 
 #[test]
@@ -2625,8 +3020,8 @@ fn a_dynamic_reader_of_a_spill_laid_out_in_a_later_round_is_evaluated_again() {
     // D1's array depends on A1's (through E1), so it is right only in the second round; F1
     // reads it through INDIRECT, which no static edge queues. After a round that lays out a
     // changed spill, the dynamic formulas are evaluated once more.
-    let book = || {
-        let mut t = T::new();
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
         t.load(
             [
                 ("Z1", "1"),
@@ -2639,13 +3034,35 @@ fn a_dynamic_reader_of_a_spill_laid_out_in_a_later_round_is_evaluated_again() {
             ]
             .map(|(a, f)| (a.to_string(), f.to_string())),
         );
-        assert_eq!(t.num("F1"), 7.0, "after load");
+        assert_eq!(t.num("F1"), 7.0, "{threads} threads, after load");
         t.set("H1", "=10");
-        assert_eq!(t.num("F1"), 25.0, "after the edit");
+        assert_eq!(t.num("F1"), 25.0, "{threads} threads, after the edit");
         assert!(t.calc.circular.is_empty());
         t
     };
-    book();
+    let (one, many) = (book(1), book(8));
+    same_values(&one, &many, "dynamic reader of a later spill");
+}
+
+#[test]
+fn random_draws_in_a_level_come_in_row_major_order_on_any_thread_count() {
+    // Odd rows draw, even rows don't, and the level is released in a mixed order: the draws
+    // still come row by row, on one thread (sorted level) and on many (the main thread's tail).
+    let book = |threads| {
+        let mut t = T::new().threads(threads);
+        t.calc.parallel_min = 1;
+        let mut cells: Vec<(String, String)> = (1..=600).map(|r| (format!("A{r}"), "=ROW()".to_string())).collect();
+        for r in 1..=600 {
+            let f = if r % 2 == 1 { format!("=A{}+RAND()", 601 - r) } else { format!("=A{}*2", 601 - r) };
+            cells.push((format!("B{r}"), f));
+        }
+        t.load(cells);
+        t
+    };
+    let one = book(1);
+    for threads in [2, 8] {
+        same_values(&one, &book(threads), &format!("{threads} threads"));
+    }
 }
 
 #[test]
