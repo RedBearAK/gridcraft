@@ -19,6 +19,7 @@ fn v(s: &Session, a: &str) -> Value {
 }
 
 mod calculation_settings;
+mod windows;
 
 #[test]
 fn entering_empty_cells_preserves_whole_sheet_formatting() {
