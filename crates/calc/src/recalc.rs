@@ -58,6 +58,9 @@ pub struct Calc {
     /// charged, given back when the formula is resolved again or removed.
     name_areas: usize,
     name_charges: HashMap<Key, usize>,
+    /// Caps the planner's index work, to test the row-major fallback.
+    #[cfg(test)]
+    pub(crate) plan_budget: Option<usize>,
 }
 
 /// A set of cells by row, each row's columns in their own set: a window of rows and columns is
@@ -109,6 +112,8 @@ impl Default for Calc {
             spill_errors: SpillErrors::default(),
             name_areas: 0,
             name_charges: HashMap::default(),
+            #[cfg(test)]
+            plan_budget: None,
         }
     }
 }
@@ -503,7 +508,11 @@ impl Calc {
     fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool) {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         self.last_recalc_cells = 0;
-        for _round in 0..8 {
+        // A planned round in which an array grew over cells read by a formula of an earlier level
+        // is calculated again in row-major order (see below); the two count as one round.
+        let mut rounds = 0;
+        let mut redo = false;
+        while rounds < 8 {
             if dirty.is_empty() {
                 break;
             }
@@ -522,20 +531,70 @@ impl Calc {
             let now = self.now();
             let mut rng = self.rng;
             let tp = prof_now();
+            // Planned, so the order the formulas are calculated in (which cell of a cycle shows
+            // `#CIRC!`, the sequence RAND draws in, how many rounds a chain of spills takes)
+            // follows the dependencies rather than the position on the sheet.
+            #[cfg(test)]
+            let plan = if redo { None } else { self.graph.levels_within(wb, &dirty, self.plan_budget) };
+            #[cfg(not(test))]
+            let plan = if redo { None } else { self.graph.levels(wb, &dirty) };
+            if std::env::var_os("GRIDCRAFT_PROFILE").is_some()
+                && let Some(p) = &plan
+            {
+                eprintln!(
+                    "  plan: {} levels over {} formulas, {} behind cycles, {} index work, {:.1} ms",
+                    p.bounds.len(),
+                    p.leveled,
+                    p.order.len() - p.leveled,
+                    p.work(),
+                    prof_now() - tp
+                );
+            }
             let (results, spills, cycles) = {
                 let mut host = PassHost::new(wb, &exprs, &mut rng, now).with_python(python);
                 host.iterate = wb.calc.iterative;
-                for k in &dirty {
-                    host.calculate(*k);
+                match &plan {
+                    Some(plan) => {
+                        for level in plan.levels() {
+                            for &k in level {
+                                host.calculate(k);
+                            }
+                        }
+                        for &k in plan.rest() {
+                            host.calculate(k);
+                        }
+                    }
+                    None => {
+                        for k in &dirty {
+                            host.calculate(*k);
+                        }
+                    }
                 }
                 if host.iterate && !host.members.is_empty() {
-                    let passes = host.iterate_loops(&dirty, wb.calc.max_iterations, wb.calc.max_change);
+                    let order: Vec<Key> = match &plan {
+                        Some(p) => p.levels().flatten().copied().chain(p.rest().iter().copied()).collect(),
+                        None => dirty.clone(),
+                    };
+                    let passes = host.iterate_loops(&order, wb.calc.max_iterations, wb.calc.max_change);
                     if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                         eprintln!("  iterative calculation: {} passes over {} formulas", passes, host.tainted.len());
                     }
                 }
                 (host.results, host.spills, host.cycles)
             };
+            // The planner holds the readers of an array's stored area back until it is laid out,
+            // and those of the area under the nearest formula above, but not every reader of cells
+            // an array spills over now and didn't before (one to its left spilling right): such a
+            // reader in an earlier level was calculated over the old values, and each write-back
+            // round would settle one link of a chain of them. The round is then thrown away and
+            // calculated again in row-major order, before anything is written back, as main
+            // calculates it; the next round is planned again.
+            if !redo && plan.as_ref().is_some_and(|p| self.grew_under_readers(wb, p, &spills)) {
+                redo = true;
+                continue;
+            }
+            redo = false;
+            rounds += 1;
             self.rng = rng;
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                 eprintln!("  eval {} formulas {:.1} ms", results.len(), prof_now() - tp);
@@ -548,10 +607,14 @@ impl Calc {
                 self.circular.retain(|k| !evaluated.contains(k));
             }
             self.circular.extend(cycles);
-            let mut spill_changes = self.write_back(wb, &dirty, results, &spills);
+            let (mut spill_changes, settled_spill_moved) = self.write_back(wb, &dirty, results, &spills);
             // Formulas with references only known while evaluating (INDIRECT, OFFSET) may have read
-            // a spill area before it was laid out: they are evaluated once more.
-            if dynamic_again && !spills.is_empty() {
+            // a spill area before it was laid out: they are evaluated once more. A planned round
+            // can lay out a spill after a formula of an earlier level read its area, so they are
+            // evaluated again after a planned round in which the spill of a formula outside their
+            // set changed (a volatile array lays out new values every time it runs, and would
+            // send them round again whatever they read).
+            if (dynamic_again || (plan.is_some() && settled_spill_moved)) && !spills.is_empty() && !self.graph.dynamic.is_empty() {
                 dynamic_again = false;
                 spill_changes.extend(self.graph.dynamic.iter().copied());
             }
@@ -577,14 +640,43 @@ impl Calc {
         }
     }
 
+    /// Whether an array of `spills` covers cells its stored spill range doesn't (it is new, or
+    /// grew or moved), and a formula `plan` put in an earlier level than its anchor reads that
+    /// area. The formulas after the levels (on or behind cycles) are calculated last.
+    fn grew_under_readers(&self, wb: &Workbook, plan: &graph::Plan, spills: &HashMap<Key, std::sync::Arc<Array>>) -> bool {
+        let mut deps = Vec::new();
+        // Each formula's level, built at the first array that has readers.
+        let mut levels: Option<HashMap<Key, usize>> = None;
+        spills.iter().any(|(k, a)| {
+            let end =
+                CellRef::new(k.1.row.saturating_add((a.rows as u32).saturating_sub(1)), k.1.col.saturating_add((a.cols as u32).saturating_sub(1)));
+            let stored = wb.sheet(k.0).and_then(|s| s.spill_ranges.get(&k.1));
+            if end == k.1 || stored.is_some_and(|r| r.contains(k.1) && r.contains(end)) {
+                return false;
+            }
+            deps.clear();
+            self.graph.dependents_of_range(k.0, RangeRef::new(k.1, end), &mut deps);
+            if deps.iter().all(|d| d == k) {
+                return false;
+            }
+            let levels = levels.get_or_insert_with(|| plan.levels().enumerate().flat_map(|(i, l)| l.iter().map(move |f| (*f, i))).collect());
+            let at = |f: &Key| levels.get(f).copied().unwrap_or(usize::MAX);
+            let anchor = at(k);
+            deps.iter().any(|d| at(d) < anchor)
+        })
+    }
+
     fn write_back(
         &mut self,
         wb: &mut Workbook,
         dirty: &[Key],
         results: HashMap<Key, Value>,
         spills: &HashMap<Key, std::sync::Arc<Array>>,
-    ) -> Vec<Key> {
+    ) -> (Vec<Key>, bool) {
         let mut spill_changes = Vec::new();
+        // Whether the spill of a formula outside the dynamic set (INDIRECT, OFFSET, volatile)
+        // changed.
+        let mut settled_spill_moved = false;
         let mut freed = Vec::new();
         for (key, value) in results {
             let Some(sheet) = wb.sheet_mut(key.0) else { continue };
@@ -612,6 +704,7 @@ impl Calc {
             {
                 continue;
             }
+            settled_spill_moved |= !self.graph.dynamic.contains(key);
             if let Some(range) = old {
                 for cell in range.iter() {
                     sheet.spill.remove(&cell);
@@ -655,7 +748,7 @@ impl Calc {
         for (sheet_index, range) in freed {
             spill_changes.extend(self.unblock_candidates(wb, sheet_index, range.end));
         }
-        spill_changes
+        (spill_changes, settled_spill_moved)
     }
 }
 
